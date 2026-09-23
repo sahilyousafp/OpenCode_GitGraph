@@ -2,7 +2,6 @@ import type {
   TuiPlugin,
   TuiPluginApi,
   TuiPluginModule,
-  TuiSlotContext,
   TuiThemeCurrent,
 } from "@opencode-ai/plugin/tui";
 import { RGBA } from "@opentui/core";
@@ -10,7 +9,6 @@ import { useTerminalDimensions } from "@opentui/solid";
 import { JSX } from "@opentui/solid/jsx-runtime";
 import { createSignal, For, Show } from "solid-js";
 import { execFile } from "node:child_process";
-import { basename } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -23,9 +21,12 @@ const REFRESH_EVENTS = [
   "file.edited",
   "vcs.branch.updated",
 ] as const;
-const KV_EXPANDED = "git-graph.sidebar.expanded";
 const GIT_TIMEOUT_MS = 5000;
-const DIFF_MAX_CHARS = 12000;
+const COMMITS_PER_BRANCH = 10;
+const MAX_BRANCHES = 8;
+const MAX_GRAPH_COLUMNS = 60;
+const MESSAGE_MAX_CHARS = 4000;
+const LINE_ALPHA = 140;
 
 const BRANCH_COLORS = [
   "#5b9bf5",
@@ -45,11 +46,17 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 }
 
 function parseCommitsPerBranch(): number {
-  return parsePositiveInt(process.env.OPENCODE_GIT_GRAPH_COMMITS, 10);
+  return parsePositiveInt(
+    process.env.OPENCODE_GIT_GRAPH_COMMITS,
+    COMMITS_PER_BRANCH,
+  );
 }
 
 function parseMaxBranches(): number {
-  return parsePositiveInt(process.env.OPENCODE_GIT_GRAPH_BRANCHES, 8);
+  return parsePositiveInt(
+    process.env.OPENCODE_GIT_GRAPH_BRANCHES,
+    MAX_BRANCHES,
+  );
 }
 
 function parseRefreshMs(): number {
@@ -80,6 +87,7 @@ export interface CommitInfo {
   sha: string;
   short: string;
   date: string;
+  ts: number;
   author: string;
   subject: string;
 }
@@ -106,6 +114,12 @@ function branchColor(
 ): RGBA {
   if (section.current) return theme.primary;
   return BRANCH_COLORS[section.order % BRANCH_COLORS.length];
+}
+
+function fade(color: RGBA, alpha: number): RGBA {
+  const faded = RGBA.clone(color);
+  faded.a = alpha;
+  return faded;
 }
 
 async function collectRepo(cwd: string): Promise<GitGraphState> {
@@ -139,15 +153,14 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
     const ordered = headBranch
       ? [headBranch, ...names.filter((name) => name !== headBranch)]
       : names;
-    const limit = parseCommitsPerBranch();
     const seen = new Set<string>();
     for (const [index, name] of ordered.slice(0, parseMaxBranches()).entries()) {
       const out = await runGit(
         [
           "log",
           "-n",
-          String(limit),
-          "--pretty=format:%H%x1f%h%x1f%ad%x1f%an%x1f%s",
+          String(parseCommitsPerBranch()),
+          "--pretty=format:%H%x1f%h%x1f%ct%x1f%ad%x1f%an%x1f%s",
           "--date=short",
           name,
         ],
@@ -156,13 +169,15 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
       const commits: CommitInfo[] = [];
       if (out) {
         for (const line of out.split("\n")) {
-          const [sha, short, date, author, subject] = line.split("\u001f");
+          const [sha, short, ts, date, author, subject] = line.split("\u001f");
           if (!sha || seen.has(sha)) continue;
           seen.add(sha);
+          const parsedTs = Number.parseInt(ts ?? "", 10);
           commits.push({
             sha,
             short: short ?? "",
             date: date ?? "",
+            ts: Number.isFinite(parsedTs) ? parsedTs : 0,
             author: stripAnsi(author ?? ""),
             subject: stripAnsi(subject ?? ""),
           });
@@ -187,254 +202,332 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
   };
 }
 
-function ColorSpan(props: {
-  fg: string | RGBA;
-  children: JSX.Element;
-}): JSX.Element {
+interface GraphNode {
+  commit: CommitInfo;
+  lanes: number[];
+  primary: number;
+  x: number;
+  y: number;
+  hit: number;
+}
+
+interface GraphLane {
+  name: string;
+  order: number;
+  current: boolean;
+  color: RGBA;
+  y: number;
+}
+
+type GraphSeg = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  color: RGBA;
+};
+
+interface GraphLayout {
+  lanes: GraphLane[];
+  nodes: GraphNode[];
+  hy: number;
+  truncated: number;
+  segments: GraphSeg[];
+}
+
+function buildLayout(
+  state: GitGraphState,
+  width: number,
+  theme: TuiThemeCurrent,
+): GraphLayout {
+  const laneCount = state.branches.length;
+  const bySha = new Map<string, GraphNode>();
+  for (const branch of state.branches) {
+    for (const commit of branch.commits) {
+      let node = bySha.get(commit.sha);
+      if (!node) {
+        node = { commit, lanes: [], primary: 0, x: 0, y: 0, hit: 1 };
+        bySha.set(commit.sha, node);
+      }
+      node.lanes.push(branch.order);
+    }
+  }
+
+  const nodes = [...bySha.values()].sort(
+    (a, b) =>
+      a.commit.ts - b.commit.ts || a.commit.sha.localeCompare(b.commit.sha),
+  );
+
+  const maxCols = Math.max(16, Math.min(MAX_GRAPH_COLUMNS, width - 4));
+  const keepFrom = Math.max(0, nodes.length - maxCols);
+  const kept = nodes.slice(keepFrom);
+  const truncated = keepFrom;
+
+  const usable = width - 2;
+  kept.forEach((node, index) => {
+    node.primary = Math.min(...node.lanes);
+    node.y = laneCount - node.primary;
+    node.x = 1 + Math.round((index * (usable - 1)) / Math.max(1, kept.length - 1));
+    const spacing = kept.length > 1 ? (usable - 1) / (kept.length - 1) : 1;
+    node.hit = Math.max(1, Math.min(3, Math.round(spacing)));
+  });
+
+  const lanes: GraphLane[] = state.branches.map((branch) => ({
+    name: branch.name,
+    order: branch.order,
+    current: branch.current,
+    color: branchColor(branch, theme),
+    y: laneCount - branch.order,
+  }));
+
+  const segments: GraphSeg[] = [];
+  for (const lane of lanes) {
+    const owned = kept
+      .filter((node) => node.primary === lane.order)
+      .sort((a, b) => a.x - b.x);
+    for (let i = 1; i < owned.length; i++) {
+      const prev = owned[i - 1];
+      const next = owned[i];
+      segments.push({
+        x: prev.x,
+        y: lane.y,
+        w: next.x - prev.x + 1,
+        h: 1,
+        color: fade(lane.color, LINE_ALPHA),
+      });
+    }
+  }
+
+  for (const node of kept) {
+    if (node.lanes.length < 2) continue;
+    const ys = node.lanes.map((order) => laneCount - order);
+    const top = Math.min(...ys);
+    const bottom = Math.max(...ys);
+    const lane = lanes.find((l) => l.order === node.primary);
+    segments.push({
+      x: node.x,
+      y: bottom,
+      w: 1,
+      h: Math.max(1, top - bottom + 1),
+      color: fade(lane?.color ?? RGBA.fromHex("#888888"), LINE_ALPHA),
+    });
+  }
+
+  return {
+    lanes,
+    nodes: kept,
+    hy: Math.max(1, laneCount),
+    truncated,
+    segments,
+  };
+}
+
+function GraphPoint(props: {
+  node: GraphNode;
+  color: RGBA;
+  selected: boolean;
+  onSelect: (node: GraphNode) => void;
+}) {
   return (
-    // `fg` is a valid TextNodeRenderable option at runtime, but the published
-    // @opentui/solid SpanProps omit it.
-    // @ts-expect-error fg is supported at runtime
-    <span fg={props.fg}>{props.children}</span>
+    <box
+      position="absolute"
+      left={props.node.x - Math.floor((props.node.hit - 1) / 2)}
+      top={props.node.y}
+      width={props.node.hit}
+      height={1}
+      justifyContent="center"
+      onMouseUp={(event) => {
+        event?.stopPropagation?.();
+        props.onSelect(props.node);
+      }}
+      zIndex={3}
+    >
+      <box width={1} height={1} backgroundColor={props.color} />
+    </box>
   );
 }
 
-function CommitDialog(props: {
+function GraphWindow(props: {
   api: TuiPluginApi;
   theme: TuiThemeCurrent;
-  commit: CommitInfo;
-  branchName: string;
-  branchColor: RGBA;
+  repo: () => GitGraphState;
+  revision: () => number;
 }) {
-  const [message, setMessage] = createSignal("");
-  const [diff, setDiff] = createSignal("");
+  props.revision();
   const dimensions = useTerminalDimensions();
-  let loaded = false;
+  const [selected, setSelected] = createSignal<GraphNode | null>(null);
+  const [message, setMessage] = createSignal("");
+  const [loading, setLoading] = createSignal(false);
 
-  const load = async () => {
-    if (loaded) return;
-    loaded = true;
+  const state = () => props.repo();
+  const width = () => Math.min(116, Math.max(40, dimensions().width - 2));
+  const layout = () => buildLayout(state(), width(), theme());
+  const theme = () => props.theme;
+
+  const select = (node: GraphNode) => {
+    setSelected(node);
+    setMessage("");
+    setLoading(true);
     const cwd =
       props.api.state.path.worktree || props.api.state.path.directory;
-    const [log, patch] = await Promise.all([
-      runGit(["log", "-1", "--format=%B", props.commit.sha], cwd),
-      runGit(["show", "--format=", "--no-color", props.commit.sha], cwd),
-    ]);
-    setMessage(stripAnsi(log ?? ""));
-    setDiff(stripAnsi(patch ?? "").slice(0, DIFF_MAX_CHARS));
+    void runGit(["log", "-1", "--format=%B", node.commit.sha], cwd).then(
+      (text) => {
+        setLoading(false);
+        setMessage(stripAnsi(text ?? "").slice(0, MESSAGE_MAX_CHARS));
+      },
+    );
   };
-  void load();
 
-  const truncated = () => diff().length >= DIFF_MAX_CHARS;
-  const bodyHeight = () => Math.max(8, dimensions().height - 10);
+  const clearSelection = () => setSelected(null);
 
   return (
     <box flexDirection="column" width="100%">
       <box flexDirection="row" width="100%">
-        <text selectable={false} fg={props.branchColor}>
-          <b>{props.branchName}</b>
+        <text selectable={false} fg={theme().primary}>
+          <b>⑂ Git Graph</b>
         </text>
-        <text selectable={false} fg={props.theme.textMuted}>
+        <Show when={state().headBranch}>
+          <text selectable={false} fg={theme().textMuted}>
+            {"  "}
+            {state().headBranch}
+          </text>
+        </Show>
+        <Show when={state().dirty}>
+          <text selectable={false} fg={theme().warning}>
+            {"  "}
+            ✎ dirty
+          </text>
+        </Show>
+        <text selectable={false} fg={theme().textMuted}>
           {"  "}
-          {props.commit.short}
-        </text>
-        <text selectable={false} fg={props.theme.textMuted}>
-          {"  "}
-          esc to close
+          click a point · esc closes
         </text>
       </box>
-      <text selectable={false} wrapMode="word" fg={props.theme.text}>
-        <b>{props.commit.subject}</b>
-      </text>
-      <box flexDirection="row" width="100%">
-        <text selectable={false} fg={props.theme.textMuted}>
-          {props.commit.author}
-        </text>
-        <text selectable={false} fg={props.theme.textMuted}>
-          {"  "}
-          {props.commit.date}
-        </text>
-        <text selectable={false} fg={props.theme.textMuted}>
-          {"  "}
-          {props.commit.sha}
-        </text>
-      </box>
+
       <Show
-        when={diff()}
+        when={layout().nodes.length > 0}
         fallback={
-          <Show when={message()}>
-            <text selectable={false} wrapMode="word" fg={props.theme.text}>
-              {message()}
-            </text>
-          </Show>
+          <text selectable={false} fg={theme().textMuted}>
+            {!state().isRepo
+              ? "not a git repo"
+              : state().error || "no commits yet"}
+          </text>
         }
       >
-        <scrollbox
-          width="100%"
-          height={bodyHeight()}
-          borderStyle="rounded"
-          borderColor={props.theme.borderSubtle}
-        >
-          <Show when={message()}>
-            <text selectable={false} wrapMode="word" fg={props.theme.text}>
-              {message()}
-            </text>
-          </Show>
-          <diff diff={diff()} view="unified" wrapMode="word" />
-          <Show when={truncated()}>
-            <text selectable={false} fg={props.theme.warning}>
-              … diff truncated ({DIFF_MAX_CHARS} chars shown)
-            </text>
-          </Show>
-        </scrollbox>
-      </Show>
-    </box>
-  );
-}
-
-function CollapsibleHeader(props: {
-  expanded: () => boolean;
-  label: string;
-  color: string | RGBA;
-  onToggle: () => void;
-}) {
-  return (
-    <box
-      flexDirection="row"
-      width="100%"
-      onMouseDown={(event) => {
-        event?.stopPropagation?.();
-        props.onToggle();
-      }}
-    >
-      <text selectable={false} fg={props.color}>
-        {props.expanded() ? "▼" : "▶"}
-      </text>
-      <text selectable={false} fg={props.color}>
-        <b>{props.label}</b>
-      </text>
-    </box>
-  );
-}
-
-function GitGraphPanel(props: {
-  api: TuiPluginApi;
-  context: TuiSlotContext;
-  repo: () => GitGraphState;
-  revision: () => number;
-  sidebarExpanded: () => boolean;
-  toggleSidebar: () => void;
-}) {
-  props.revision();
-  const theme = () => props.context.theme.current;
-
-  const openCommit = (section: BranchCommitSection, commit: CommitInfo) => {
-    props.api.ui.dialog.setSize("xlarge");
-    props.api.ui.dialog.replace(
-      () => (
-        <CommitDialog
-          api={props.api}
-          theme={theme()}
-          commit={commit}
-          branchName={section.name}
-          branchColor={branchColor(section, theme())}
-        />
-      ),
-      () => undefined,
-    );
-  };
-
-  return (
-    <box
-      flexDirection="column"
-      width="100%"
-      borderStyle="rounded"
-      paddingLeft={1}
-      paddingRight={1}
-      borderColor={theme().border}
-    >
-      <CollapsibleHeader
-        expanded={props.sidebarExpanded}
-        label={`Git · ${basename(
-          props.api.state.path.worktree || props.api.state.path.directory,
-        )}`}
-        color={theme().primary}
-        onToggle={props.toggleSidebar}
-      />
-      <Show when={props.sidebarExpanded()}>
         <box flexDirection="column" width="100%">
-          <box flexDirection="row" width="100%">
-            <Show when={props.repo().headBranch}>
-              <text selectable={false} wrapMode="none" fg={theme().primary}>
-                <b>⑂ {props.repo().headBranch}</b>
-              </text>
-            </Show>
-            <Show when={props.repo().dirty}>
-              <text selectable={false} wrapMode="none" fg={theme().warning}>
-                <b>✎ dirty</b>
-              </text>
-            </Show>
-          </box>
-          <Show
-            when={props.repo().branches.length > 0}
-            fallback={
-              <text selectable={false} wrapMode="none" fg={theme().textMuted}>
-                {!props.repo().isRepo
-                  ? "not a git repo"
-                  : props.repo().error || "no commits"}
-              </text>
-            }
-          >
-            <For each={props.repo().branches}>
-              {(section) => {
-                const color = branchColor(section, theme());
+          <box position="relative" width={width()} height={layout().hy}>
+            <For each={layout().segments}>
+              {(seg) => (
+                <box
+                  position="absolute"
+                  left={seg.x}
+                  top={seg.y}
+                  width={seg.w}
+                  height={seg.h}
+                  backgroundColor={seg.color}
+                  zIndex={1}
+                />
+              )}
+            </For>
+            <For each={layout().nodes}>
+              {(node) => {
+                const lane = layout().lanes.find(
+                  (l) => l.order === node.primary,
+                );
                 return (
-                  <box flexDirection="column" width="100%">
-                    <box flexDirection="row" width="100%">
-                      <text selectable={false} wrapMode="none" fg={color}>
-                        <b>
-                          {section.current ? "◉" : "◌"} {section.name}
-                        </b>
-                      </text>
-                      <Show when={section.commits[0]}>
-                        <text selectable={false} wrapMode="none" fg={theme().textMuted}>
-                          {" "}
-                          {section.commits[0]?.short}
-                        </text>
-                      </Show>
-                      <Show when={section.commits.length === 0}>
-                        <text selectable={false} wrapMode="none" fg={theme().textMuted}>
-                          {" "}
-                          merged
-                        </text>
-                      </Show>
-                    </box>
-                    <Show when={section.commits.length > 0}>
-                      <For each={section.commits}>
-                        {(commit) => (
-                          <box
-                            flexDirection="row"
-                            width="100%"
-                            onMouseUp={(event) => {
-                              event?.stopPropagation?.();
-                              openCommit(section, commit);
-                            }}
-                          >
-                            <text selectable={false} wrapMode="none" truncate>
-                              <ColorSpan fg={color}>{commit.subject}</ColorSpan>
-                              <ColorSpan fg={theme().textMuted}>
-                                {" "}
-                                {commit.date}
-                              </ColorSpan>
-                            </text>
-                          </box>
-                        )}
-                      </For>
-                    </Show>
-                  </box>
+                  <GraphPoint
+                    node={node}
+                    color={lane?.color ?? theme().textMuted}
+                    selected={selected()?.commit.sha === node.commit.sha}
+                    onSelect={select}
+                  />
                 );
               }}
             </For>
+          </box>
+
+          <box flexDirection="row" width="100%" flexWrap="wrap">
+            <For each={layout().lanes}>
+              {(lane) => (
+                <box flexDirection="row">
+                  <text selectable={false} wrapMode="none" fg={lane.color}>
+                    <b>
+                      {lane.current ? "◉" : "◌"} {lane.name}
+                    </b>
+                  </text>
+                  <text selectable={false} fg={theme().textMuted}>
+                    {"  "}
+                  </text>
+                </box>
+              )}
+            </For>
+          </box>
+          <Show when={layout().truncated > 0}>
+            <text selectable={false} fg={theme().warning}>
+              … {layout().truncated} older commits hidden
+            </text>
+          </Show>
+        </box>
+      </Show>
+
+      <Show when={selected()}>
+        <box
+          width={width()}
+          flexDirection="column"
+          borderStyle="rounded"
+          borderColor={theme().border}
+          backgroundColor={theme().backgroundPanel}
+          paddingX={1}
+          zIndex={10}
+          onMouseUp={(event) => {
+            event?.stopPropagation?.();
+          }}
+        >
+          <box flexDirection="row" width="100%">
+            <text selectable={false} fg={theme().textMuted}>
+              {selected()!.commit.short}
+            </text>
+            <text selectable={false} fg={theme().textMuted}>
+              {"  "}
+              {selected()!.commit.author}
+            </text>
+            <text selectable={false} fg={theme().textMuted}>
+              {"  "}
+              {selected()!.commit.date}
+            </text>
+            <box
+              onMouseUp={(event) => {
+                event?.stopPropagation?.();
+                clearSelection();
+              }}
+            >
+              <text selectable={false} fg={theme().warning}>
+                {"  "}
+                ⊗
+              </text>
+            </box>
+          </box>
+          <text selectable={false} wrapMode="word" fg={theme().text}>
+            <b>{selected()!.commit.subject}</b>
+          </text>
+          <Show when={loading()}>
+            <text selectable={false} fg={theme().textMuted}>
+              loading message…
+            </text>
+          </Show>
+          <Show
+            when={message()}
+            fallback={
+              <Show when={!loading()}>
+                <text selectable={false} fg={theme().textMuted}>
+                  (no message body)
+                </text>
+              </Show>
+            }
+          >
+            <text selectable={false} wrapMode="word" fg={theme().text}>
+              {message()}
+            </text>
           </Show>
         </box>
       </Show>
@@ -452,14 +545,20 @@ function createGitGraph(api: TuiPluginApi) {
     error: "",
   });
   const [revision, setRevision] = createSignal(0);
-  const [sidebarExpanded, setSidebarExpanded] = createSignal(
-    api.kv.get(KV_EXPANDED, true),
-  );
 
-  const toggleSidebar = () => {
-    const next = !sidebarExpanded();
-    setSidebarExpanded(next);
-    api.kv.set(KV_EXPANDED, next);
+  const openGraph = (theme?: TuiThemeCurrent) => {
+    api.ui.dialog.setSize("xlarge");
+    api.ui.dialog.replace(
+      () => (
+        <GraphWindow
+          api={api}
+          theme={theme ?? api.theme.current}
+          repo={repo}
+          revision={revision}
+        />
+      ),
+      () => undefined,
+    );
   };
 
   let refreshing = false;
@@ -500,24 +599,53 @@ function createGitGraph(api: TuiPluginApi) {
   return {
     order: 40,
     slots: {
-      sidebar_content(context: TuiSlotContext) {
+      app_bottom() {
+        const theme = () => api.theme.current;
         return (
-          <GitGraphPanel
-            api={api}
-            context={context}
-            repo={repo}
-            revision={revision}
-            sidebarExpanded={sidebarExpanded}
-            toggleSidebar={toggleSidebar}
-          />
+          <box
+            flexDirection="row"
+            width="100%"
+            justifyContent="flex-end"
+            paddingRight={1}
+          >
+            <box
+              onMouseUp={(event) => {
+                event?.stopPropagation?.();
+                openGraph(theme());
+              }}
+            >
+              <text selectable={false} fg={theme().primary}>
+                <u>⑂ Git Graph</u>
+              </text>
+            </box>
+          </box>
         );
       },
     },
+    openGraph,
   };
 }
 
 const tui: TuiPlugin = async (api) => {
-  api.slots.register(createGitGraph(api));
+  const git = createGitGraph(api);
+  api.slots.register(git);
+  const dispose = api.keymap.registerLayer({
+    commands: [
+      {
+        name: "git-graph.open",
+        title: "Open git graph",
+        slashName: "gitgraph",
+        category: "VCS",
+        namespace: "palette",
+        run() {
+          git.openGraph(api.theme.current);
+        },
+      },
+    ],
+  });
+  api.lifecycle.onDispose(() => {
+    dispose?.();
+  });
 };
 
 const plugin: TuiPluginModule = {
