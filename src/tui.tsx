@@ -24,9 +24,8 @@ const REFRESH_EVENTS = [
 const GIT_TIMEOUT_MS = 5000;
 const COMMITS_PER_BRANCH = 10;
 const MAX_BRANCHES = 8;
-const MAX_GRAPH_COLUMNS = 60;
 const MESSAGE_MAX_CHARS = 4000;
-const LINE_ALPHA = 140;
+const FIELD_SEP = String.fromCharCode(31);
 
 const BRANCH_COLORS = [
   "#5b9bf5",
@@ -116,12 +115,6 @@ function branchColor(
   return BRANCH_COLORS[section.order % BRANCH_COLORS.length];
 }
 
-function fade(color: RGBA, alpha: number): RGBA {
-  const faded = RGBA.clone(color);
-  faded.a = alpha;
-  return faded;
-}
-
 async function collectRepo(cwd: string): Promise<GitGraphState> {
   const isWorktree =
     (await runGit(["rev-parse", "--is-inside-work-tree"], cwd))?.trim() ===
@@ -153,14 +146,13 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
     const ordered = headBranch
       ? [headBranch, ...names.filter((name) => name !== headBranch)]
       : names;
-    const seen = new Set<string>();
     for (const [index, name] of ordered.slice(0, parseMaxBranches()).entries()) {
       const out = await runGit(
         [
           "log",
           "-n",
           String(parseCommitsPerBranch()),
-          "--pretty=format:%H%x1f%h%x1f%ct%x1f%ad%x1f%an%x1f%s",
+          `--pretty=format:%H%x1f%h%x1f%ct%x1f%ad%x1f%an%x1f%s`,
           "--date=short",
           name,
         ],
@@ -169,9 +161,8 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
       const commits: CommitInfo[] = [];
       if (out) {
         for (const line of out.split("\n")) {
-          const [sha, short, ts, date, author, subject] = line.split("\u001f");
-          if (!sha || seen.has(sha)) continue;
-          seen.add(sha);
+          const [sha, short, ts, date, author, subject] = line.split(FIELD_SEP);
+          if (!sha) continue;
           const parsedTs = Number.parseInt(ts ?? "", 10);
           commits.push({
             sha,
@@ -202,149 +193,89 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
   };
 }
 
-interface GraphNode {
-  commit: CommitInfo;
-  lanes: number[];
-  primary: number;
-  x: number;
-  y: number;
-  hit: number;
-}
-
-interface GraphLane {
+export interface LogLane {
   name: string;
   order: number;
   current: boolean;
   color: RGBA;
-  y: number;
 }
 
-type GraphSeg = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  color: RGBA;
-};
-
-interface GraphLayout {
-  lanes: GraphLane[];
-  nodes: GraphNode[];
-  hy: number;
-  truncated: number;
-  segments: GraphSeg[];
+export interface LogCell {
+  char: string;
+  color?: RGBA;
 }
 
-function buildLayout(
-  state: GitGraphState,
-  width: number,
-  theme: TuiThemeCurrent,
-): GraphLayout {
-  const laneCount = state.branches.length;
-  const bySha = new Map<string, GraphNode>();
+export interface LogRow {
+  commit: CommitInfo;
+  primary: number;
+  cells: LogCell[];
+}
+
+export interface LogLayout {
+  lanes: LogLane[];
+  rows: LogRow[];
+}
+
+function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
+  const bySha = new Map<string, { commit: CommitInfo; lanes: number[] }>();
   for (const branch of state.branches) {
     for (const commit of branch.commits) {
-      let node = bySha.get(commit.sha);
-      if (!node) {
-        node = { commit, lanes: [], primary: 0, x: 0, y: 0, hit: 1 };
-        bySha.set(commit.sha, node);
+      let entry = bySha.get(commit.sha);
+      if (!entry) {
+        entry = { commit, lanes: [] };
+        bySha.set(commit.sha, entry);
       }
-      node.lanes.push(branch.order);
+      if (!entry.lanes.includes(branch.order)) {
+        entry.lanes.push(branch.order);
+      }
     }
   }
 
-  const nodes = [...bySha.values()].sort(
+  const sorted = [...bySha.values()].sort(
     (a, b) =>
-      a.commit.ts - b.commit.ts || a.commit.sha.localeCompare(b.commit.sha),
+      b.commit.ts - a.commit.ts || a.commit.sha.localeCompare(b.commit.sha),
   );
 
-  const maxCols = Math.max(16, Math.min(MAX_GRAPH_COLUMNS, width - 4));
-  const keepFrom = Math.max(0, nodes.length - maxCols);
-  const kept = nodes.slice(keepFrom);
-  const truncated = keepFrom;
-
-  const usable = width - 2;
-  kept.forEach((node, index) => {
-    node.primary = Math.min(...node.lanes);
-    node.y = laneCount - node.primary;
-    node.x = 1 + Math.round((index * (usable - 1)) / Math.max(1, kept.length - 1));
-    const spacing = kept.length > 1 ? (usable - 1) / (kept.length - 1) : 1;
-    node.hit = Math.max(1, Math.min(3, Math.round(spacing)));
-  });
-
-  const lanes: GraphLane[] = state.branches.map((branch) => ({
+  const lanes: LogLane[] = state.branches.map((branch) => ({
     name: branch.name,
     order: branch.order,
     current: branch.current,
     color: branchColor(branch, theme),
-    y: laneCount - branch.order,
   }));
 
-  const segments: GraphSeg[] = [];
-  for (const lane of lanes) {
-    const owned = kept
-      .filter((node) => node.primary === lane.order)
-      .sort((a, b) => a.x - b.x);
-    for (let i = 1; i < owned.length; i++) {
-      const prev = owned[i - 1];
-      const next = owned[i];
-      segments.push({
-        x: prev.x,
-        y: lane.y,
-        w: next.x - prev.x + 1,
-        h: 1,
-        color: fade(lane.color, LINE_ALPHA),
-      });
+  const laneStart = new Map<number, number>();
+  sorted.forEach((entry, index) => {
+    for (const order of entry.lanes) {
+      if (!laneStart.has(order)) laneStart.set(order, index);
     }
-  }
+  });
 
-  for (const node of kept) {
-    if (node.lanes.length < 2) continue;
-    const ys = node.lanes.map((order) => laneCount - order);
-    const top = Math.min(...ys);
-    const bottom = Math.max(...ys);
-    const lane = lanes.find((l) => l.order === node.primary);
-    segments.push({
-      x: node.x,
-      y: bottom,
-      w: 1,
-      h: Math.max(1, top - bottom + 1),
-      color: fade(lane?.color ?? RGBA.fromHex("#888888"), LINE_ALPHA),
-    });
-  }
+  const rows: LogRow[] = sorted.map((entry, index) => {
+    const primary = Math.min(...entry.lanes);
+    const minCol = Math.min(...entry.lanes);
+    const maxCol = Math.max(...entry.lanes);
+    const cells: LogCell[] = [];
+    for (let col = 0; col < lanes.length; col++) {
+      const start = laneStart.get(col);
+      if (entry.lanes.includes(col)) {
+        cells.push({ char: "\u25cf", color: lanes[col].color });
+      } else if (start !== undefined && index >= start) {
+        cells.push({ char: "\u2502", color: lanes[col].color });
+      } else {
+        cells.push({ char: " " });
+      }
+    }
+    if (entry.lanes.length > 1) {
+      for (let col = minCol + 1; col < maxCol; col++) {
+        if (cells[col].char === " ") {
+          cells[col] = { char: "\u2500", color: lanes[primary].color };
+        }
+      }
+    }
+    return { commit: entry.commit, primary, cells };
+  });
 
-  return {
-    lanes,
-    nodes: kept,
-    hy: Math.max(1, laneCount),
-    truncated,
-    segments,
-  };
-}
-
-function GraphPoint(props: {
-  node: GraphNode;
-  color: RGBA;
-  selected: boolean;
-  onSelect: (node: GraphNode) => void;
-}) {
-  return (
-    <box
-      position="absolute"
-      left={props.node.x - Math.floor((props.node.hit - 1) / 2)}
-      top={props.node.y}
-      width={props.node.hit}
-      height={1}
-      justifyContent="center"
-      onMouseUp={(event) => {
-        event?.stopPropagation?.();
-        props.onSelect(props.node);
-      }}
-      zIndex={3}
-    >
-      <box width={1} height={1} backgroundColor={props.color} />
-    </box>
-  );
+  return { lanes, rows };
 }
 
 function GraphWindow(props: {
@@ -355,25 +286,51 @@ function GraphWindow(props: {
 }) {
   props.revision();
   const dimensions = useTerminalDimensions();
-  const [selected, setSelected] = createSignal<GraphNode | null>(null);
+  const [selected, setSelected] = createSignal<LogRow | null>(null);
   const [message, setMessage] = createSignal("");
   const [loading, setLoading] = createSignal(false);
 
   const state = () => props.repo();
-  const width = () => Math.min(116, Math.max(40, dimensions().width - 2));
-  const layout = () => buildLayout(state(), width(), theme());
   const theme = () => props.theme;
+  const width = () => Math.min(116, Math.max(40, dimensions().width - 2));
+  const layout = () => buildLog(state(), theme());
 
-  const select = (node: GraphNode) => {
-    setSelected(node);
+  const listHeight = () => {
+    const detailRows = selected() ? 10 : 0;
+    return Math.max(
+      6,
+      Math.min(layout().rows.length, dimensions().height - 8 - detailRows),
+    );
+  };
+
+  const bodyRows = () => {
+    const charsPerLine = Math.max(40, width() - 4);
+    return Math.max(1, Math.ceil(message().length / charsPerLine));
+  };
+
+  const bodyHeight = () => {
+    const maxRows = Math.max(4, Math.floor(dimensions().height / 3));
+    return Math.min(Math.max(bodyRows(), 2), maxRows);
+  };
+
+  const select = (row: LogRow) => {
+    setSelected(row);
     setMessage("");
     setLoading(true);
     const cwd =
       props.api.state.path.worktree || props.api.state.path.directory;
-    void runGit(["log", "-1", "--format=%B", node.commit.sha], cwd).then(
+    void runGit(["log", "-1", "--format=%B", row.commit.sha], cwd).then(
       (text) => {
         setLoading(false);
-        setMessage(stripAnsi(text ?? "").slice(0, MESSAGE_MAX_CHARS));
+        const full = stripAnsi(text ?? "");
+        const newline = full.indexOf("\n");
+        const firstLine = newline >= 0 ? full.slice(0, newline) : full;
+        const rest = newline >= 0 ? full.slice(newline + 1) : "";
+        const body =
+          firstLine.trim() === row.commit.subject
+            ? rest.trim()
+            : full.trim();
+        setMessage(body.slice(0, MESSAGE_MAX_CHARS));
       },
     );
   };
@@ -382,30 +339,45 @@ function GraphWindow(props: {
 
   return (
     <box flexDirection="column" width="100%">
-      <box flexDirection="row" width="100%">
-        <text selectable={false} fg={theme().primary}>
-          <b>⑂ Git Graph</b>
-        </text>
-        <Show when={state().headBranch}>
-          <text selectable={false} fg={theme().textMuted}>
-            {"  "}
-            {state().headBranch}
+      <box flexDirection="row" width="100%" justifyContent="space-between">
+        <box flexDirection="row" flexShrink={1}>
+          <text selectable={false} flexShrink={0} wrapMode="none" fg={theme().primary}>
+            <b>⑂ Git Graph</b>
           </text>
-        </Show>
-        <Show when={state().dirty}>
-          <text selectable={false} fg={theme().warning}>
-            {"  "}
-            ✎ dirty
-          </text>
-        </Show>
-        <text selectable={false} fg={theme().textMuted}>
-          {"  "}
-          click a point · esc closes
+          <Show when={state().headBranch}>
+            <text selectable={false} flexShrink={1} truncate wrapMode="none" fg={theme().textMuted}>
+              {"  "}
+              {state().headBranch}
+            </text>
+          </Show>
+          <Show when={state().dirty}>
+            <text selectable={false} flexShrink={0} wrapMode="none" fg={theme().warning}>
+              {"  "}
+              ✎ dirty
+            </text>
+          </Show>
+        </box>
+        <text selectable={false} flexShrink={0} wrapMode="none" fg={theme().textMuted}>
+          click a commit · esc closes
         </text>
       </box>
 
+      <box flexDirection="row" width="100%" flexWrap="wrap">
+        <For each={layout().lanes}>
+          {(lane) => (
+            <box flexDirection="row" flexShrink={0} paddingRight={2}>
+              <text selectable={false} wrapMode="none" fg={lane.color}>
+                <b>
+                  {lane.current ? "◉" : "◌"} {lane.name}
+                </b>
+              </text>
+            </box>
+          )}
+        </For>
+      </box>
+
       <Show
-        when={layout().nodes.length > 0}
+        when={layout().rows.length > 0}
         fallback={
           <text selectable={false} fg={theme().textMuted}>
             {!state().isRepo
@@ -414,95 +386,110 @@ function GraphWindow(props: {
           </text>
         }
       >
-        <box flexDirection="column" width="100%">
-          <box position="relative" width={width()} height={layout().hy}>
-            <For each={layout().segments}>
-              {(seg) => (
+        <scrollbox width="100%" height={listHeight()}>
+          <For each={layout().rows}>
+            {(row) => {
+              const isSelected = () =>
+                selected()?.commit.sha === row.commit.sha;
+              return (
                 <box
-                  position="absolute"
-                  left={seg.x}
-                  top={seg.y}
-                  width={seg.w}
-                  height={seg.h}
-                  backgroundColor={seg.color}
-                  zIndex={1}
-                />
-              )}
-            </For>
-            <For each={layout().nodes}>
-              {(node) => {
-                const lane = layout().lanes.find(
-                  (l) => l.order === node.primary,
-                );
-                return (
-                  <GraphPoint
-                    node={node}
-                    color={lane?.color ?? theme().textMuted}
-                    selected={selected()?.commit.sha === node.commit.sha}
-                    onSelect={select}
-                  />
-                );
-              }}
-            </For>
-          </box>
-
-          <box flexDirection="row" width="100%" flexWrap="wrap">
-            <For each={layout().lanes}>
-              {(lane) => (
-                <box flexDirection="row">
-                  <text selectable={false} wrapMode="none" fg={lane.color}>
-                    <b>
-                      {lane.current ? "◉" : "◌"} {lane.name}
-                    </b>
-                  </text>
-                  <text selectable={false} fg={theme().textMuted}>
+                  flexDirection="row"
+                  width="100%"
+                  onMouseUp={(event) => {
+                    event?.stopPropagation?.();
+                    select(row);
+                  }}
+                >
+                  <box flexDirection="row" flexShrink={0}>
+                    <For each={row.cells}>
+                      {(cell) => (
+                        <text selectable={false} fg={cell.color ?? theme().textMuted}>
+                          {cell.char}
+                        </text>
+                      )}
+                    </For>
+                  </box>
+                  <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+                    {" "}
+                    {row.commit.short}
                     {"  "}
                   </text>
+                  <text
+                    selectable={false}
+                    flexShrink={1}
+                    truncate
+                    wrapMode="none"
+                    fg={isSelected() ? theme().primary : theme().text}
+                  >
+                    {row.commit.subject}
+                  </text>
                 </box>
-              )}
-            </For>
-          </box>
-          <Show when={layout().truncated > 0}>
-            <text selectable={false} fg={theme().warning}>
-              … {layout().truncated} older commits hidden
-            </text>
-          </Show>
-        </box>
+              );
+            }}
+          </For>
+        </scrollbox>
       </Show>
 
       <Show when={selected()}>
         <box
-          width={width()}
+          width="100%"
           flexDirection="column"
           borderStyle="rounded"
           borderColor={theme().border}
           backgroundColor={theme().backgroundPanel}
           paddingX={1}
-          zIndex={10}
           onMouseUp={(event) => {
             event?.stopPropagation?.();
           }}
         >
           <box flexDirection="row" width="100%">
-            <text selectable={false} fg={theme().textMuted}>
+            <text selectable={false} flexShrink={0} fg={theme().textMuted}>
               {selected()!.commit.short}
             </text>
-            <text selectable={false} fg={theme().textMuted}>
+            <text selectable={false} flexShrink={1} truncate wrapMode="none" fg={theme().textMuted}>
               {"  "}
               {selected()!.commit.author}
             </text>
-            <text selectable={false} fg={theme().textMuted}>
+            <text selectable={false} flexShrink={0} fg={theme().textMuted}>
               {"  "}
               {selected()!.commit.date}
             </text>
+            <Show
+              when={(() => {
+                const row = selected();
+                if (!row) return undefined;
+                return layout().lanes.find(
+                  (lane) => lane.order === row.primary,
+                );
+              })()}
+            >
+              {(lane: LogLane) => (
+                <text
+                  selectable={false}
+                  flexShrink={1}
+                  truncate
+                  wrapMode="none"
+                  fg={lane.color}
+                >
+                  {"  "}
+                  ◉ {lane.name}
+                </text>
+              )}
+            </Show>
+            <box flexShrink={0}>
+              <text selectable={false} fg={theme().warning}>
+                {"  "}
+                ⊗
+              </text>
+            </box>
             <box
+              flexShrink={0}
               onMouseUp={(event) => {
                 event?.stopPropagation?.();
                 clearSelection();
               }}
             >
               <text selectable={false} fg={theme().warning}>
-                {"  "}
                 ⊗
               </text>
             </box>
@@ -525,9 +512,11 @@ function GraphWindow(props: {
               </Show>
             }
           >
-            <text selectable={false} wrapMode="word" fg={theme().text}>
-              {message()}
-            </text>
+            <scrollbox width="100%" height={bodyHeight()}>
+              <text selectable={false} wrapMode="word" fg={theme().text}>
+                {message()}
+              </text>
+            </scrollbox>
           </Show>
         </box>
       </Show>
