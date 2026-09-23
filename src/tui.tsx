@@ -47,6 +47,20 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function abbreviateHome(input: string, home: string): string {
+  if (!home || !input) return input;
+  const relative = path.relative(home, input);
+  if (relative === "") return "~";
+  if (
+    relative === ".." ||
+    relative.startsWith(".." + path.sep) ||
+    path.isAbsolute(relative)
+  ) {
+    return input;
+  }
+  return "~" + path.sep + relative;
+}
+
 function parseCommitsPerBranch(): number {
   return parsePositiveInt(
     process.env.OPENCODE_GIT_GRAPH_COMMITS,
@@ -481,26 +495,39 @@ function GraphWindow(props: {
   const width = () => Math.min(116, Math.max(40, dimensions().width - 2));
   const layout = () => buildLog(state(), theme());
 
-  const listHeight = () => {
-    const detailRows = selected() ? 12 : 0;
-    const legendRows = 4;
-    return Math.max(
-      6,
-      Math.min(
-        layout().rows.length,
-        dimensions().height - 10 - detailRows - legendRows,
-      ),
-    );
+  // Dialog backdrop pads top by termH/4; cap content at ~termH/2 so the panel
+  // spans roughly termH/4..3termH/4 (optically centered, never cut off).
+  const contentMax = () =>
+    Math.max(12, Math.floor(dimensions().height / 2) - 2);
+
+  const chromeRows = () => {
+    const header = 2;
+    const gaps = 4;
+    const legend = 5;
+    const detail = selected() ? 8 : 0;
+    return header + gaps + legend + detail;
   };
 
-  const bodyRows = () => {
-    const charsPerLine = Math.max(40, width() - 4);
-    return Math.max(1, Math.ceil(message().length / charsPerLine));
+  const sharedBudget = () =>
+    Math.max(6, contentMax() - chromeRows());
+
+  const listHeight = () => {
+    const budget = sharedBudget();
+    const rows = layout().rows.length;
+    if (!selected()) return Math.max(4, Math.min(rows, budget));
+    const listShare = Math.max(4, Math.floor(budget * 0.55));
+    return Math.max(4, Math.min(rows, listShare));
   };
 
   const bodyHeight = () => {
-    const maxRows = Math.max(4, Math.floor(dimensions().height / 3));
-    return Math.min(Math.max(bodyRows(), 2), maxRows);
+    if (!selected()) return 0;
+    const remain = Math.max(2, sharedBudget() - listHeight());
+    const charsPerLine = Math.max(40, width() - 4);
+    const need = Math.max(
+      2,
+      Math.ceil(message().length / charsPerLine),
+    );
+    return Math.min(need, remain);
   };
 
   const scrollList = (delta: number) => {
@@ -550,7 +577,12 @@ function GraphWindow(props: {
   const showWorktrees = () => worktrees().length > 1;
 
   return (
-    <box flexDirection="column" width="100%" gap={1}>
+    <box
+      flexDirection="column"
+      width="100%"
+      gap={1}
+      maxHeight={contentMax()}
+    >
       <box
         flexDirection="row"
         width="100%"
@@ -864,7 +896,6 @@ function createGitGraph(api: TuiPluginApi) {
   const [revision, setRevision] = createSignal(0);
 
   const openGraph = (theme?: TuiThemeCurrent) => {
-    api.ui.dialog.setSize("xlarge");
     api.ui.dialog.replace(
       () => (
         <GraphWindow
@@ -876,6 +907,8 @@ function createGitGraph(api: TuiPluginApi) {
       ),
       () => undefined,
     );
+    // replace() resets size to "medium" - set after so xlarge sticks.
+    api.ui.dialog.setSize("xlarge");
   };
 
   let refreshing = false;
@@ -916,24 +949,60 @@ function createGitGraph(api: TuiPluginApi) {
   return {
     order: 50,
     slots: {
-      sidebar_footer() {
+      sidebar_footer(_ctx: unknown, props?: { session_id?: string }) {
         const theme = () => api.theme.current;
+        const session = () =>
+          props?.session_id
+            ? api.state.session.get(props.session_id)
+            : undefined;
+        const pathInfo = () => {
+          const dir =
+            session()?.directory ||
+            api.state.path.directory ||
+            os.homedir();
+          const out = abbreviateHome(dir, os.homedir());
+          const branch =
+            session()?.directory === api.state.path.directory
+              ? api.state.vcs?.branch
+              : undefined;
+          const text = branch ? out + ":" + branch : out;
+          const list = text.split("/");
+          return {
+            parent: list.slice(0, -1).join("/"),
+            name: list.at(-1) ?? "",
+          };
+        };
         return (
-          <box
-            flexDirection="row"
-            width="100%"
-            justifyContent="flex-end"
-            paddingRight={1}
-          >
+          <box flexDirection="column" width="100%" gap={1}>
+            <text>
+              <span style={{ fg: theme().textMuted }}>
+                {pathInfo().parent}/
+              </span>
+              <span style={{ fg: theme().text }}>{pathInfo().name}</span>
+            </text>
             <box
-              onMouseUp={(event) => {
-                event?.stopPropagation?.();
-                openGraph(theme());
-              }}
+              flexDirection="row"
+              width="100%"
+              justifyContent="space-between"
+              paddingRight={1}
             >
-              <text selectable={false} fg={theme().primary}>
-                <u>⑂ Git Graph</u>
+              <text fg={theme().textMuted}>
+                <span style={{ fg: theme().success }}>•</span> <b>Open</b>
+                <span style={{ fg: theme().text }}>
+                  <b>Code</b>
+                </span>{" "}
+                <span>{api.app.version}</span>
               </text>
+              <box
+                onMouseUp={(event) => {
+                  event?.stopPropagation?.();
+                  openGraph(theme());
+                }}
+              >
+                <text selectable={false} fg={theme().primary}>
+                  <u>⑂ Git Graph</u>
+                </text>
+              </box>
             </box>
           </box>
         );
