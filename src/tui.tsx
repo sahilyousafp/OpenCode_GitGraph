@@ -5,7 +5,9 @@ import type {
   TuiSlotContext,
   TuiThemeCurrent,
 } from "@opencode-ai/plugin/tui";
-import { RGBA, StyledText, TextChunk } from "@opentui/core";
+import { RGBA } from "@opentui/core";
+import { useTerminalDimensions } from "@opentui/solid";
+import { JSX } from "@opentui/solid/jsx-runtime";
 import { createSignal, For, Show } from "solid-js";
 import { execFile } from "node:child_process";
 import { basename } from "node:path";
@@ -185,17 +187,16 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
   };
 }
 
-function commitRowContent(
-  commit: CommitInfo,
-  color: RGBA,
-  theme: TuiThemeCurrent,
-): StyledText {
-  const chunks: TextChunk[] = [
-    { __isChunk: true, text: "  ", fg: theme.textMuted },
-    { __isChunk: true, text: commit.subject, fg: color },
-    { __isChunk: true, text: ` ${commit.date}`, fg: theme.textMuted },
-  ];
-  return new StyledText(chunks);
+function ColorSpan(props: {
+  fg: string | RGBA;
+  children: JSX.Element;
+}): JSX.Element {
+  return (
+    // `fg` is a valid TextNodeRenderable option at runtime, but the published
+    // @opentui/solid SpanProps omit it.
+    // @ts-expect-error fg is supported at runtime
+    <span fg={props.fg}>{props.children}</span>
+  );
 }
 
 function CommitDialog(props: {
@@ -207,6 +208,7 @@ function CommitDialog(props: {
 }) {
   const [message, setMessage] = createSignal("");
   const [diff, setDiff] = createSignal("");
+  const dimensions = useTerminalDimensions();
   let loaded = false;
 
   const load = async () => {
@@ -223,8 +225,8 @@ function CommitDialog(props: {
   };
   void load();
 
-  const truncated = () =>
-    diff().length >= DIFF_MAX_CHARS;
+  const truncated = () => diff().length >= DIFF_MAX_CHARS;
+  const bodyHeight = () => Math.max(8, dimensions().height - 10);
 
   return (
     <box flexDirection="column" width="100%">
@@ -257,26 +259,34 @@ function CommitDialog(props: {
           {props.commit.sha}
         </text>
       </box>
-      <Show when={message()}>
-        <text selectable={false} wrapMode="word" fg={props.theme.text}>
-          {message()}
-        </text>
-      </Show>
-      <Show when={diff()}>
-        <box
-          flexDirection="column"
+      <Show
+        when={diff()}
+        fallback={
+          <Show when={message()}>
+            <text selectable={false} wrapMode="word" fg={props.theme.text}>
+              {message()}
+            </text>
+          </Show>
+        }
+      >
+        <scrollbox
           width="100%"
-          paddingTop={0}
+          height={bodyHeight()}
           borderStyle="rounded"
           borderColor={props.theme.borderSubtle}
         >
+          <Show when={message()}>
+            <text selectable={false} wrapMode="word" fg={props.theme.text}>
+              {message()}
+            </text>
+          </Show>
           <diff diff={diff()} view="unified" wrapMode="word" />
           <Show when={truncated()}>
             <text selectable={false} fg={props.theme.warning}>
-              … diff truncated
+              … diff truncated ({DIFF_MAX_CHARS} chars shown)
             </text>
           </Show>
-        </box>
+        </scrollbox>
       </Show>
     </box>
   );
@@ -405,17 +415,18 @@ function GitGraphPanel(props: {
                           <box
                             flexDirection="row"
                             width="100%"
-                            onMouseDown={(event) => {
+                            onMouseUp={(event) => {
                               event?.stopPropagation?.();
                               openCommit(section, commit);
                             }}
                           >
-                            <text
-                              selectable={false}
-                              wrapMode="none"
-                              truncate
-                              content={commitRowContent(commit, color, theme())}
-                            />
+                            <text selectable={false} wrapMode="none" truncate>
+                              <ColorSpan fg={color}>{commit.subject}</ColorSpan>
+                              <ColorSpan fg={theme().textMuted}>
+                                {" "}
+                                {commit.date}
+                              </ColorSpan>
+                            </text>
                           </box>
                         )}
                       </For>
