@@ -1,0 +1,65 @@
+{
+  "name": "opencode-git-graph",
+  "version": "1.0.0",
+  "description": "OpenCode TUI plugin that renders a graphical git commit graph in the sidebar",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sahilyousafp/OpenCode_GitGraph.git"
+  },
+  "packageManager": "pnpm@11.2.2",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "main": "./dist/tui.js",
+  "types": "./dist/tui.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepack": "npm run build",
+    "pack:dry-run": "npm pack --dry-run",
+    "dev": "tsup --watch"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "tui",
+    "git",
+    "git-graph",
+    "commit-graph"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.50 <2",
+    "@opentui/core": ">=0.4.0 <0.6",
+    "@opentui/solid": ">=0.4.0 <0.6",
+    "solid-js": ">=1.9.12 <2"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.15.11",
+    "@opentui/core": "^0.4.0",
+    "@opentui/solid": "^0.4.0",
+    "@types/node": "^22.19.19",
+    "esbuild-plugin-solid": "^0.6.0",
+    "solid-js": "1.9.12",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  }
+}
