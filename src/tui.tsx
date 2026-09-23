@@ -4,11 +4,14 @@ import type {
   TuiPluginModule,
   TuiThemeCurrent,
 } from "@opencode-ai/plugin/tui";
-import { RGBA } from "@opentui/core";
+import { RGBA, type MouseEvent, type ScrollBoxRenderable } from "@opentui/core";
 import { useTerminalDimensions } from "@opentui/solid";
 import { JSX } from "@opentui/solid/jsx-runtime";
 import { createSignal, For, Show } from "solid-js";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
+import { writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -82,6 +85,100 @@ async function runGit(
   }
 }
 
+function hasCommand(command: string): boolean {
+  try {
+    execFileSync(process.platform === "win32" ? "where" : "which", [command], {
+      stdio: "ignore",
+      timeout: 2000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runGitSync(args: string[], cwd: string): string | undefined {
+  try {
+    const stdout = execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveIdeCommand(cwd: string): string | undefined {
+  const envEditor = process.env.VISUAL || process.env.EDITOR;
+  if (envEditor) return envEditor;
+  const configured = runGitSync(["config", "--get", "core.editor"], cwd);
+  if (configured) return configured;
+  const candidates = [
+    "code",
+    "cursor",
+    "code-insiders",
+    "subl",
+    "idea",
+    "zed",
+    "nvim",
+    "vim",
+  ];
+  for (const candidate of candidates) {
+    if (hasCommand(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+async function openDiffInIde(sha: string, cwd: string): Promise<void> {
+  const diff = await runGit(
+    ["show", "--patch", "--stat", "--find-renames", sha],
+    cwd,
+  );
+  if (diff === undefined) return;
+  const file = path.join(
+    os.tmpdir(),
+    `opencode-commit-${sha.slice(0, 8)}.diff`,
+  );
+  await writeFile(file, diff, "utf8");
+
+  const editor = resolveIdeCommand(cwd);
+  if (editor) {
+    const parts = editor.split(/\s+/u).filter(Boolean);
+    const child = spawn(parts[0] ?? editor, [...parts.slice(1), file], {
+      cwd,
+      detached: true,
+      stdio: "ignore",
+      shell: process.platform === "win32",
+    });
+    child.unref();
+    return;
+  }
+
+  if (process.platform === "win32") {
+    const child = spawn("cmd", ["/c", "start", "", file], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+  } else if (process.platform === "darwin") {
+    const child = spawn("open", [file], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+  } else {
+    const child = spawn("xdg-open", [file], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+  }
+}
+
 export interface CommitInfo {
   sha: string;
   short: string;
@@ -89,6 +186,15 @@ export interface CommitInfo {
   ts: number;
   author: string;
   subject: string;
+  parents: string[];
+}
+
+export interface WorktreeInfo {
+  path: string;
+  head: string;
+  branch: string;
+  detached: boolean;
+  current: boolean;
 }
 
 export type BranchCommitSection = {
@@ -104,6 +210,7 @@ export interface GitGraphState {
   dirty: boolean;
   isRepo: boolean;
   isWorktree: boolean;
+  worktrees: WorktreeInfo[];
   error: string;
 }
 
@@ -113,6 +220,42 @@ function branchColor(
 ): RGBA {
   if (section.current) return theme.primary;
   return BRANCH_COLORS[section.order % BRANCH_COLORS.length];
+}
+
+function parseWorktrees(porcelain: string | undefined): WorktreeInfo[] {
+  if (!porcelain) return [];
+  const worktrees: WorktreeInfo[] = [];
+  let current: WorktreeInfo | null = null;
+  for (const raw of porcelain.split("\n")) {
+    const line = raw.trim();
+    if (!line) {
+      if (current) worktrees.push(current);
+      current = null;
+      continue;
+    }
+    if (line.startsWith("worktree ")) {
+      if (current) worktrees.push(current);
+      current = {
+        path: line.slice("worktree ".length),
+        head: "",
+        branch: "",
+        detached: false,
+        current: false,
+      };
+    } else if (current && line.startsWith("HEAD ")) {
+      current.head = line.slice("HEAD ".length);
+    } else if (current && line.startsWith("branch ")) {
+      current.branch = line
+        .slice("branch ".length)
+        .replace(/^refs\/heads\//u, "");
+    } else if (current && line === "detached") {
+      current.detached = true;
+    } else if (current && line === "bare") {
+      current.path = `${current.path} (bare)`;
+    }
+  }
+  if (current) worktrees.push(current);
+  return worktrees;
 }
 
 async function collectRepo(cwd: string): Promise<GitGraphState> {
@@ -125,6 +268,17 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
   const porcelain = await runGit(["status", "--porcelain"], cwd);
   const dirty =
     !!porcelain && porcelain.split("\n").some((line) => line.trim().length > 0);
+  const worktrees = parseWorktrees(
+    await runGit(["worktree", "list", "--porcelain"], cwd),
+  );
+  const cwdResolved = path.resolve(cwd);
+  for (const worktree of worktrees) {
+    try {
+      worktree.current = path.resolve(worktree.path) === cwdResolved;
+    } catch {
+      worktree.current = false;
+    }
+  }
 
   const branches: BranchCommitSection[] = [];
   let error = "";
@@ -152,7 +306,7 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
           "log",
           "-n",
           String(parseCommitsPerBranch()),
-          `--pretty=format:%H%x1f%h%x1f%ct%x1f%ad%x1f%an%x1f%s`,
+          `--pretty=format:%H%x1f%h%x1f%ct%x1f%ad%x1f%an%x1f%s%x1f%P`,
           "--date=short",
           name,
         ],
@@ -161,7 +315,8 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
       const commits: CommitInfo[] = [];
       if (out) {
         for (const line of out.split("\n")) {
-          const [sha, short, ts, date, author, subject] = line.split(FIELD_SEP);
+          const [sha, short, ts, date, author, subject, parents] =
+            line.split(FIELD_SEP);
           if (!sha) continue;
           const parsedTs = Number.parseInt(ts ?? "", 10);
           commits.push({
@@ -171,6 +326,10 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
             ts: Number.isFinite(parsedTs) ? parsedTs : 0,
             author: stripAnsi(author ?? ""),
             subject: stripAnsi(subject ?? ""),
+            parents: (parents ?? "")
+              .split(/\s+/u)
+              .map((parent) => parent.trim())
+              .filter(Boolean),
           });
         }
       }
@@ -189,6 +348,7 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
     dirty,
     isRepo: isWorktree,
     isWorktree,
+    worktrees,
     error,
   };
 }
@@ -209,6 +369,7 @@ export interface LogRow {
   commit: CommitInfo;
   primary: number;
   cells: LogCell[];
+  isMerge: boolean;
 }
 
 export interface LogLayout {
@@ -250,10 +411,34 @@ function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
     }
   });
 
+  sorted.forEach((entry, index) => {
+    if (entry.commit.parents.length < 2) return;
+    for (const parentSha of entry.commit.parents) {
+      const parent = bySha.get(parentSha);
+      if (!parent) continue;
+      for (const order of parent.lanes) {
+        const existing = laneStart.get(order);
+        if (existing === undefined || index < existing) {
+          laneStart.set(order, index);
+        }
+      }
+    }
+  });
+
   const rows: LogRow[] = sorted.map((entry, index) => {
     const primary = Math.min(...entry.lanes);
-    const minCol = Math.min(...entry.lanes);
-    const maxCol = Math.max(...entry.lanes);
+    const isMerge = entry.commit.parents.length > 1;
+    const bridgeLanes = new Set(entry.lanes);
+    if (isMerge) {
+      for (const parentSha of entry.commit.parents) {
+        const parent = bySha.get(parentSha);
+        if (!parent) continue;
+        for (const order of parent.lanes) bridgeLanes.add(order);
+      }
+    }
+    const bridgeCols = [...bridgeLanes].sort((a, b) => a - b);
+    const minCol = bridgeCols[0] ?? primary;
+    const maxCol = bridgeCols[bridgeCols.length - 1] ?? primary;
     const cells: LogCell[] = [];
     for (let col = 0; col < lanes.length; col++) {
       const start = laneStart.get(col);
@@ -265,14 +450,14 @@ function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
         cells.push({ char: " " });
       }
     }
-    if (entry.lanes.length > 1) {
+    if (bridgeCols.length > 1 || (isMerge && maxCol > minCol)) {
       for (let col = minCol + 1; col < maxCol; col++) {
-        if (cells[col].char === " ") {
+        if (cells[col]?.char === " " || cells[col]?.char === "\u2502") {
           cells[col] = { char: "\u2500", color: lanes[primary].color };
         }
       }
     }
-    return { commit: entry.commit, primary, cells };
+    return { commit: entry.commit, primary, cells, isMerge };
   });
 
   return { lanes, rows };
@@ -289,6 +474,7 @@ function GraphWindow(props: {
   const [selected, setSelected] = createSignal<LogRow | null>(null);
   const [message, setMessage] = createSignal("");
   const [loading, setLoading] = createSignal(false);
+  let listScroll: ScrollBoxRenderable | undefined;
 
   const state = () => props.repo();
   const theme = () => props.theme;
@@ -296,10 +482,14 @@ function GraphWindow(props: {
   const layout = () => buildLog(state(), theme());
 
   const listHeight = () => {
-    const detailRows = selected() ? 10 : 0;
+    const detailRows = selected() ? 12 : 0;
+    const legendRows = 4;
     return Math.max(
       6,
-      Math.min(layout().rows.length, dimensions().height - 8 - detailRows),
+      Math.min(
+        layout().rows.length,
+        dimensions().height - 10 - detailRows - legendRows,
+      ),
     );
   };
 
@@ -311,6 +501,10 @@ function GraphWindow(props: {
   const bodyHeight = () => {
     const maxRows = Math.max(4, Math.floor(dimensions().height / 3));
     return Math.min(Math.max(bodyRows(), 2), maxRows);
+  };
+
+  const scrollList = (delta: number) => {
+    listScroll?.scrollBy(delta, "viewport");
   };
 
   const select = (row: LogRow) => {
@@ -337,9 +531,32 @@ function GraphWindow(props: {
 
   const clearSelection = () => setSelected(null);
 
+  const openSelectedDiff = (event?: MouseEvent) => {
+    event?.stopPropagation?.();
+    const row = selected();
+    if (!row) return;
+    const cwd =
+      props.api.state.path.worktree || props.api.state.path.directory;
+    void openDiffInIde(row.commit.sha, cwd);
+  };
+
+  const selectedLane = () => {
+    const row = selected();
+    if (!row) return undefined;
+    return layout().lanes.find((lane) => lane.order === row.primary);
+  };
+
+  const worktrees = () => state().worktrees;
+  const showWorktrees = () => worktrees().length > 1;
+
   return (
-    <box flexDirection="column" width="100%">
-      <box flexDirection="row" width="100%" justifyContent="space-between">
+    <box flexDirection="column" width="100%" gap={1}>
+      <box
+        flexDirection="row"
+        width="100%"
+        justifyContent="space-between"
+        paddingBottom={1}
+      >
         <box flexDirection="row" flexShrink={1}>
           <text selectable={false} flexShrink={0} wrapMode="none" fg={theme().primary}>
             <b>⑂ Git Graph</b>
@@ -362,164 +579,274 @@ function GraphWindow(props: {
         </text>
       </box>
 
-      <box flexDirection="row" width="100%" flexWrap="wrap">
-        <For each={layout().lanes}>
-          {(lane) => (
-            <box flexDirection="row" flexShrink={0} paddingRight={2}>
-              <text selectable={false} wrapMode="none" fg={lane.color}>
-                <b>
-                  {lane.current ? "◉" : "◌"} {lane.name}
-                </b>
-              </text>
-            </box>
-          )}
-        </For>
-      </box>
-
-      <Show
-        when={layout().rows.length > 0}
-        fallback={
-          <text selectable={false} fg={theme().textMuted}>
-            {!state().isRepo
-              ? "not a git repo"
-              : state().error || "no commits yet"}
-          </text>
-        }
-      >
-        <scrollbox width="100%" height={listHeight()}>
-          <For each={layout().rows}>
-            {(row) => {
-              const isSelected = () =>
-                selected()?.commit.sha === row.commit.sha;
-              return (
-                <box
-                  flexDirection="row"
-                  width="100%"
-                  onMouseUp={(event) => {
-                    event?.stopPropagation?.();
-                    select(row);
-                  }}
-                >
-                  <box flexDirection="row" flexShrink={0}>
-                    <For each={row.cells}>
-                      {(cell) => (
-                        <text selectable={false} fg={cell.color ?? theme().textMuted}>
-                          {cell.char}
-                        </text>
-                      )}
-                    </For>
-                  </box>
-                  <text selectable={false} flexShrink={0} fg={theme().textMuted}>
-                    {" "}
-                    {row.commit.short}
-                    {"  "}
-                  </text>
-                  <text
-                    selectable={false}
-                    flexShrink={1}
-                    truncate
-                    wrapMode="none"
-                    fg={isSelected() ? theme().primary : theme().text}
-                  >
-                    {row.commit.subject}
-                  </text>
-                </box>
-              );
+      <box flexDirection="row" width="100%" gap={2}>
+        <box
+          flexDirection="column"
+          flexShrink={0}
+          height={listHeight()}
+          justifyContent="space-between"
+          paddingRight={1}
+        >
+          <box
+            onMouseUp={(event) => {
+              event?.stopPropagation?.();
+              scrollList(-3);
             }}
-          </For>
-        </scrollbox>
-      </Show>
+          >
+            <text selectable={false} fg={theme().primary}>
+              ▲
+            </text>
+          </box>
+          <box
+            onMouseUp={(event) => {
+              event?.stopPropagation?.();
+              scrollList(3);
+            }}
+          >
+            <text selectable={false} fg={theme().primary}>
+              ▼
+            </text>
+          </box>
+        </box>
+
+        <box flexGrow={1} minWidth={0}>
+          <Show
+            when={layout().rows.length > 0}
+            fallback={
+              <text selectable={false} fg={theme().textMuted}>
+                {!state().isRepo
+                  ? "not a git repo"
+                  : state().error || "no commits yet"}
+              </text>
+            }
+          >
+            <scrollbox
+              width="100%"
+              height={listHeight()}
+              ref={(el: ScrollBoxRenderable) => {
+                listScroll = el;
+              }}
+            >
+              <For each={layout().rows}>
+                {(row) => {
+                  const isSelected = () =>
+                    selected()?.commit.sha === row.commit.sha;
+                  return (
+                    <box
+                      flexDirection="row"
+                      width="100%"
+                      onMouseUp={(event) => {
+                        event?.stopPropagation?.();
+                        select(row);
+                      }}
+                    >
+                      <box flexDirection="row" flexShrink={0}>
+                        <For each={row.cells}>
+                          {(cell) => (
+                            <text selectable={false} fg={cell.color ?? theme().textMuted}>
+                              {cell.char}
+                            </text>
+                          )}
+                        </For>
+                      </box>
+                      <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+                        {" "}
+                        {row.commit.short}
+                        {"  "}
+                      </text>
+                      <Show when={row.isMerge}>
+                        <text selectable={false} flexShrink={0} fg={theme().primary}>
+                          ⑂{" "}
+                        </text>
+                      </Show>
+                      <text
+                        selectable={false}
+                        flexShrink={1}
+                        truncate
+                        wrapMode="none"
+                        fg={isSelected() ? theme().primary : theme().text}
+                      >
+                        {row.commit.subject}
+                      </text>
+                    </box>
+                  );
+                }}
+              </For>
+            </scrollbox>
+          </Show>
+        </box>
+      </box>
 
       <Show when={selected()}>
         <box
           width="100%"
-          flexDirection="column"
+          flexDirection="row"
           borderStyle="rounded"
           borderColor={theme().border}
           backgroundColor={theme().backgroundPanel}
           paddingX={1}
+          paddingTop={1}
+          paddingBottom={1}
+          gap={2}
           onMouseUp={(event) => {
             event?.stopPropagation?.();
           }}
         >
-          <box flexDirection="row" width="100%">
-            <text selectable={false} flexShrink={0} fg={theme().textMuted}>
-              {selected()!.commit.short}
-            </text>
-            <text selectable={false} flexShrink={1} truncate wrapMode="none" fg={theme().textMuted}>
-              {"  "}
-              {selected()!.commit.author}
-            </text>
-            <text selectable={false} flexShrink={0} fg={theme().textMuted}>
-              {"  "}
-              {selected()!.commit.date}
-            </text>
-            <Show
-              when={(() => {
-                const row = selected();
-                if (!row) return undefined;
-                return layout().lanes.find(
-                  (lane) => lane.order === row.primary,
-                );
-              })()}
-            >
-              {(lane: LogLane) => (
-                <text
-                  selectable={false}
-                  flexShrink={1}
-                  truncate
-                  wrapMode="none"
-                  fg={lane.color}
-                >
+          <box flexDirection="column" flexGrow={1} minWidth={0} gap={1}>
+            <box flexDirection="row" width="100%" justifyContent="space-between">
+              <box flexDirection="row" flexShrink={1} minWidth={0}>
+                <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+                  {selected()!.commit.short}
+                </text>
+                <text selectable={false} flexShrink={1} truncate wrapMode="none" fg={theme().textMuted}>
                   {"  "}
-                  ◉ {lane.name}
+                  {selected()!.commit.author}
                 </text>
-              )}
-            </Show>
-            <box flexShrink={0}>
-              <text selectable={false} fg={theme().warning}>
-                {"  "}
-                ⊗
-              </text>
+                <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+                  {"  "}
+                  {selected()!.commit.date}
+                </text>
+                <Show when={selectedLane()}>
+                  {(lane: LogLane) => (
+                    <text
+                      selectable={false}
+                      flexShrink={1}
+                      truncate
+                      wrapMode="none"
+                      fg={lane.color}
+                    >
+                      {"  "}
+                      ◉ {lane.name}
+                    </text>
+                  )}
+                </Show>
+                <Show when={selected()!.isMerge}>
+                  <text selectable={false} flexShrink={0} fg={theme().primary}>
+                    {"  "}
+                    ⑂ merge
+                  </text>
+                </Show>
+              </box>
+              <box flexDirection="row" flexShrink={0} gap={1}>
+                <box onMouseUp={(event) => openSelectedDiff(event)}>
+                  <text selectable={false} fg={theme().primary}>
+                    ↗
+                  </text>
+                </box>
+                <box
+                  onMouseUp={(event) => {
+                    event?.stopPropagation?.();
+                    clearSelection();
+                  }}
+                >
+                  <text selectable={false} fg={theme().warning}>
+                    ⊗
+                  </text>
+                </box>
+              </box>
             </box>
-            <box
-              flexShrink={0}
-              onMouseUp={(event) => {
-                event?.stopPropagation?.();
-                clearSelection();
-              }}
-            >
-              <text selectable={false} fg={theme().warning}>
-                ⊗
-              </text>
-            </box>
-          </box>
-          <text selectable={false} wrapMode="word" fg={theme().text}>
-            <b>{selected()!.commit.subject}</b>
-          </text>
-          <Show when={loading()}>
-            <text selectable={false} fg={theme().textMuted}>
-              loading message…
+            <text selectable={false} wrapMode="word" fg={theme().text}>
+              <b>{selected()!.commit.subject}</b>
             </text>
-          </Show>
-          <Show
-            when={message()}
-            fallback={
-              <Show when={!loading()}>
-                <text selectable={false} fg={theme().textMuted}>
-                  (no message body)
-                </text>
-              </Show>
-            }
-          >
-            <scrollbox width="100%" height={bodyHeight()}>
-              <text selectable={false} wrapMode="word" fg={theme().text}>
-                {message()}
+            <Show when={loading()}>
+              <text selectable={false} fg={theme().textMuted}>
+                loading message…
               </text>
-            </scrollbox>
+            </Show>
+            <Show
+              when={message()}
+              fallback={
+                <Show when={!loading()}>
+                  <text selectable={false} fg={theme().textMuted}>
+                    (no message body)
+                  </text>
+                </Show>
+              }
+            >
+              <scrollbox width="100%" height={bodyHeight()}>
+                <text selectable={false} wrapMode="word" fg={theme().text}>
+                  {message()}
+                </text>
+              </scrollbox>
+            </Show>
+          </box>
+
+          <Show when={showWorktrees()}>
+            <box
+              flexDirection="column"
+              flexShrink={0}
+              width={30}
+              gap={1}
+              borderStyle="rounded"
+              borderColor={theme().border}
+              backgroundColor={theme().backgroundElement}
+              paddingX={1}
+              paddingTop={1}
+              paddingBottom={1}
+            >
+              <text selectable={false} wrapMode="none" fg={theme().textMuted}>
+                <b>worktrees</b>
+              </text>
+              <For each={worktrees()}>
+                {(worktree) => (
+                  <box flexDirection="column" gap={0}>
+                    <text
+                      selectable={false}
+                      wrapMode="none"
+                      truncate
+                      fg={worktree.current ? theme().primary : theme().text}
+                    >
+                      {worktree.current ? "◉ " : "◌ "}
+                      {worktree.branch ||
+                        (worktree.detached
+                          ? "detached"
+                          : worktree.head.slice(0, 7))}
+                    </text>
+                    <text
+                      selectable={false}
+                      wrapMode="none"
+                      truncate
+                      fg={theme().textMuted}
+                    >
+                      {worktree.path}
+                    </text>
+                  </box>
+                )}
+              </For>
+            </box>
           </Show>
         </box>
       </Show>
+
+      <box
+        flexDirection="column"
+        width="100%"
+        gap={1}
+        borderStyle="rounded"
+        borderColor={theme().border}
+        backgroundColor={theme().backgroundElement}
+        paddingX={1}
+        paddingTop={1}
+        paddingBottom={1}
+        marginTop={1}
+      >
+        <text selectable={false} wrapMode="none" fg={theme().textMuted}>
+          branches
+        </text>
+        <box flexDirection="row" width="100%" flexWrap="wrap" gap={2}>
+          <For each={layout().lanes}>
+            {(lane) => (
+              <box flexDirection="row" flexShrink={0}>
+                <text selectable={false} wrapMode="none" fg={lane.color}>
+                  <b>
+                    {lane.current ? "◉" : "◌"} {lane.name}
+                  </b>
+                </text>
+              </box>
+            )}
+          </For>
+        </box>
+      </box>
     </box>
   );
 }
@@ -531,6 +858,7 @@ function createGitGraph(api: TuiPluginApi) {
     dirty: false,
     isRepo: false,
     isWorktree: false,
+    worktrees: [],
     error: "",
   });
   const [revision, setRevision] = createSignal(0);
