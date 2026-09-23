@@ -586,9 +586,9 @@ function createGitGraph(api: TuiPluginApi) {
   refresh();
 
   return {
-    order: 40,
+    order: 50,
     slots: {
-      app_bottom() {
+      sidebar_footer() {
         const theme = () => api.theme.current;
         return (
           <box
