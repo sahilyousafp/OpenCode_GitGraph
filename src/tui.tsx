@@ -221,6 +221,7 @@ export type BranchCommitSection = {
 export interface GitGraphState {
   branches: BranchCommitSection[];
   headBranch: string;
+  headSha: string;
   dirty: boolean;
   isRepo: boolean;
   isWorktree: boolean;
@@ -279,6 +280,7 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
   const headBranch = (
     (await runGit(["branch", "--show-current"], cwd)) ?? ""
   ).trim();
+  const headSha = ((await runGit(["rev-parse", "HEAD"], cwd)) ?? "").trim();
   const porcelain = await runGit(["status", "--porcelain"], cwd);
   const dirty =
     !!porcelain && porcelain.split("\n").some((line) => line.trim().length > 0);
@@ -359,6 +361,7 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
   return {
     branches,
     headBranch,
+    headSha,
     dirty,
     isRepo: isWorktree,
     isWorktree,
@@ -384,6 +387,7 @@ export interface LogRow {
   primary: number;
   cells: LogCell[];
   isMerge: boolean;
+  isHead: boolean;
 }
 
 export interface LogLayout {
@@ -454,10 +458,14 @@ function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
     const minCol = bridgeCols[0] ?? primary;
     const maxCol = bridgeCols[bridgeCols.length - 1] ?? primary;
     const cells: LogCell[] = [];
+    const isHead = !!state.headSha && entry.commit.sha === state.headSha;
     for (let col = 0; col < lanes.length; col++) {
       const start = laneStart.get(col);
       if (entry.lanes.includes(col)) {
-        cells.push({ char: "\u25cf", color: lanes[col].color });
+        cells.push({
+          char: isHead ? "\u25c9" : "\u25cf",
+          color: lanes[col].color,
+        });
       } else if (start !== undefined && index >= start) {
         cells.push({ char: "\u2502", color: lanes[col].color });
       } else {
@@ -471,7 +479,7 @@ function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
         }
       }
     }
-    return { commit: entry.commit, primary, cells, isMerge };
+    return { commit: entry.commit, primary, cells, isMerge, isHead };
   });
 
   return { lanes, rows };
@@ -488,6 +496,7 @@ function GraphWindow(props: {
   const [selected, setSelected] = createSignal<LogRow | null>(null);
   const [message, setMessage] = createSignal("");
   const [loading, setLoading] = createSignal(false);
+  const [mergeBase, setMergeBase] = createSignal("");
   let listScroll: ScrollBoxRenderable | undefined;
 
   const state = () => props.repo();
@@ -517,9 +526,16 @@ function GraphWindow(props: {
     Math.max(36, Math.min(56, Math.floor(width() * 0.45)));
 
   const bodyHeight = () => {
-    if (!selected()) return 0;
-    // meta + subject + loading/placeholder + gaps inside the right pane
-    const innerChrome = 7;
+    const row = selected();
+    if (!row) return 0;
+    const parentLines =
+      row.commit.parents.length > 1 ? row.commit.parents.length : 1;
+    const baseLines = mergeBase() ? 1 : 0;
+    const worktreeLines = showWorktrees()
+      ? 4 + worktrees().length
+      : 0;
+    // meta + subject + parents + merge-base + loading + gaps + worktrees
+    const innerChrome = 6 + parentLines + baseLines + worktreeLines;
     return Math.max(2, listHeight() - innerChrome);
   };
 
@@ -530,6 +546,7 @@ function GraphWindow(props: {
   const select = (row: LogRow) => {
     setSelected(row);
     setMessage("");
+    setMergeBase("");
     setLoading(true);
     const cwd =
       props.api.state.path.worktree || props.api.state.path.directory;
@@ -547,6 +564,16 @@ function GraphWindow(props: {
         setMessage(body.slice(0, MESSAGE_MAX_CHARS));
       },
     );
+    if (row.commit.parents.length >= 2) {
+      const [first, second] = row.commit.parents;
+      void runGit(["merge-base", first!, second!], cwd).then((baseSha) => {
+        const sha = (baseSha ?? "").trim();
+        if (!sha) return;
+        void runGit(["log", "-1", "--format=%h %s", sha], cwd).then((info) => {
+          setMergeBase((info ?? "").trim());
+        });
+      });
+    }
   };
 
   const clearSelection = () => setSelected(null);
@@ -590,6 +617,12 @@ function GraphWindow(props: {
             <text selectable={false} flexShrink={1} truncate wrapMode="none" fg={theme().textMuted}>
               {"  "}
               {state().headBranch}
+            </text>
+          </Show>
+          <Show when={!state().headBranch && state().headSha}>
+            <text selectable={false} flexShrink={0} wrapMode="none" fg={theme().warning}>
+              {"  "}
+              HEAD → {state().headSha.slice(0, 7)}
             </text>
           </Show>
           <Show when={state().dirty}>
@@ -680,8 +713,14 @@ function GraphWindow(props: {
                           )}
                         </For>
                       </box>
-                      <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+                      <text
+                        selectable={false}
+                        flexShrink={0}
+                        wrapMode="none"
+                        fg={row.isHead ? theme().primary : theme().textMuted}
+                      >
                         {" "}
+                        {row.isHead ? "→ " : ""}
                         {row.commit.short}
                         {"  "}
                       </text>
@@ -779,6 +818,39 @@ function GraphWindow(props: {
             <text selectable={false} wrapMode="word" fg={theme().text}>
               <b>{selected()!.commit.subject}</b>
             </text>
+            <Show when={selected()!.commit.parents.length > 0}>
+              <box flexDirection="column" width="100%" gap={0}>
+                <For each={selected()!.commit.parents}>
+                  {(parent, index) => {
+                    const branchNames = state().branches
+                      .filter((branch) =>
+                        branch.commits.some((c) => c.sha === parent),
+                      )
+                      .map((branch) => branch.name);
+                    const label =
+                      selected()!.commit.parents.length > 1
+                        ? index() === 0
+                          ? "first: "
+                          : `merged${index() > 1 ? ` ${index()}` : ""}: `
+                        : "parent: ";
+                    return (
+                      <text selectable={false} wrapMode="none" truncate fg={theme().textMuted}>
+                        {label}
+                        {parent.slice(0, 7)}
+                        {branchNames.length > 0
+                          ? ` (${branchNames.join(", ")})`
+                          : ""}
+                      </text>
+                    );
+                  }}
+                </For>
+              </box>
+            </Show>
+            <Show when={mergeBase()}>
+              <text selectable={false} wrapMode="none" truncate fg={theme().textMuted}>
+                merge-base: {mergeBase()}
+              </text>
+            </Show>
             <Show when={loading()}>
               <text selectable={false} fg={theme().textMuted}>
                 loading message…
@@ -876,6 +948,7 @@ function createGitGraph(api: TuiPluginApi) {
   const [repo, setRepo] = createSignal<GitGraphState>({
     branches: [],
     headBranch: "",
+    headSha: "",
     dirty: false,
     isRepo: false,
     isWorktree: false,

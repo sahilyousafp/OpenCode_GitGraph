@@ -1,32 +1,40 @@
 # opencode-git-graph
 
-**Branch-colour-coded git history for the OpenCode TUI sidebar.**
+**Colour-coded git commit graph for the OpenCode TUI.**
 
-`opencode-git-graph` renders your repository's branches and commits in the sidebar as colour-coded sections and opens a diff overlay when you click a commit.
+Opens a dialog with a vertical git-log lane graph, commit list, and a right-hand detail pane. Works as a **TUI plugin** for OpenCode.
 
-This package works as a **TUI sidebar plugin** for OpenCode.
+![Git Graph screenshot](./docs/screenshot.png)
 
 ---
 
 ## What you get
 
-- A sidebar section (`Git · <repo-name>`) listing **local branches**, each in its own colour:
-  - the current branch uses your theme's primary colour (`◉`);
-  - other branches cycle through a palette (`◌`);
-- The most recent commits **per branch**, deduplicated across branches, coloured to match their branch;
-- A clean head/dirty indicator row (`⑂ <branch>` / `✎ dirty`);
-- **Click a commit** to open an overlay with the full commit message, author/date/full hash, and the unified diff (`git show`), with a `… diff truncated` marker for very large diffs;
-- Auto-refresh on message/todo/session/file/git events plus a periodic fallback.
-
-## Screenshot
-
-_TBD: add a screenshot of the sidebar and the commit overlay._
+- **Lane graph** with branch colours; current branch lane uses the theme primary colour
+- **HEAD marker** - the current commit shows `◉` in the graph and `→ short-sha` in the list; detached HEAD shows `HEAD → sha` in the header
+- **Merge visibility** - `⑂` badge, horizontal bridge in the graph; detail pane lists `first:` / `merged:` parents and the **merge-base**
+- **Click a commit** → message, parents, merge-base, author/date on the right (graph stays left)
+- **Worktrees** panel when the repo has more than one worktree
+- **↗** open unified diff in your IDE / default diff viewer
+- Scroll arrows (▲/▼), branch legend at the bottom
+- Auto-refresh on session/file/git events plus a periodic fallback
+- Sidebar footer shows path:branch, OpenCode version, and a **⑂ Git Graph** shortcut (alongside the built-in footer content)
 
 ---
 
-## Install
+## Install (any PC with OpenCode)
 
-Add the plugin to your OpenCode TUI config:
+### CLI (recommended)
+
+```bash
+opencode plugin -g opencode-git-graph
+```
+
+Then restart OpenCode. (`-g` writes global config; omit for project-local `.opencode/tui.json`.)
+
+### Config file
+
+Add the plugin to `~/.config/opencode/tui.json` (Windows: `C:\Users\<user>\.config\opencode\tui.json`):
 
 ```json
 {
@@ -35,23 +43,14 @@ Add the plugin to your OpenCode TUI config:
 }
 ```
 
-Your TUI config usually lives at:
+Restart OpenCode after editing. The package is downloaded into OpenCode's plugin cache on startup.
 
-```txt
-~/.config/opencode/tui.json
-```
+### Open the graph
 
-Restart OpenCode after editing the file.
+- Command palette: `git-graph.open` or slash command `/gitgraph`
+- Or click **⑂ Git Graph** in the sidebar footer
 
-### Install from source (git)
-
-You can also point OpenCode at the plugin file directly:
-
-```json
-{
-  "plugin": ["/path/to/OpenCode_GitGraph/src/tui.tsx"]
-}
-```
+If you previously installed the local file plugin (`./plugins/git-graph.tsx`), remove that entry when adding the npm package - both use id `git-graph` and the second is rejected as a duplicate.
 
 ---
 
@@ -67,7 +66,7 @@ You can also point OpenCode at the plugin file directly:
 
 ## Requirements
 
-- OpenCode >= 1.14.50 (TUI peer dependency set)
+- OpenCode >= 1.14.50
 - `git` available on `PATH`
 
 ## License
