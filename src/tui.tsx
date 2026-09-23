@@ -495,39 +495,32 @@ function GraphWindow(props: {
   const width = () => Math.min(116, Math.max(40, dimensions().width - 2));
   const layout = () => buildLog(state(), theme());
 
-  // Dialog backdrop pads top by termH/4; cap content at ~termH/2 so the panel
-  // spans roughly termH/4..3termH/4 (optically centered, never cut off).
+  // Dialog backdrop pads top by termH/4; cap content at ~0.6*termH (+20% on
+  // the old termH/2 cap) so the panel stays centered and never cut off.
   const contentMax = () =>
-    Math.max(12, Math.floor(dimensions().height / 2) - 2);
+    Math.max(14, Math.floor(dimensions().height * 0.6) - 2);
 
   const chromeRows = () => {
     const header = 2;
-    const gaps = 4;
+    const gaps = 3;
     const legend = 5;
-    const detail = selected() ? 8 : 0;
-    return header + gaps + legend + detail;
+    return header + gaps + legend;
   };
-
-  const sharedBudget = () =>
-    Math.max(6, contentMax() - chromeRows());
 
   const listHeight = () => {
-    const budget = sharedBudget();
+    const budget = Math.max(6, contentMax() - chromeRows());
     const rows = layout().rows.length;
-    if (!selected()) return Math.max(4, Math.min(rows, budget));
-    const listShare = Math.max(4, Math.floor(budget * 0.55));
-    return Math.max(4, Math.min(rows, listShare));
+    return Math.max(6, Math.min(rows || 6, budget));
   };
+
+  const detailWidth = () =>
+    Math.max(36, Math.min(56, Math.floor(width() * 0.45)));
 
   const bodyHeight = () => {
     if (!selected()) return 0;
-    const remain = Math.max(2, sharedBudget() - listHeight());
-    const charsPerLine = Math.max(40, width() - 4);
-    const need = Math.max(
-      2,
-      Math.ceil(message().length / charsPerLine),
-    );
-    return Math.min(need, remain);
+    // meta + subject + loading/placeholder + gaps inside the right pane
+    const innerChrome = 7;
+    return Math.max(2, listHeight() - innerChrome);
   };
 
   const scrollList = (delta: number) => {
@@ -611,7 +604,13 @@ function GraphWindow(props: {
         </text>
       </box>
 
-      <box flexDirection="row" width="100%" gap={2}>
+      <box
+        flexDirection="row"
+        width="100%"
+        gap={2}
+        height={listHeight()}
+        minHeight={listHeight()}
+      >
         <box
           flexDirection="column"
           flexShrink={0}
@@ -707,24 +706,24 @@ function GraphWindow(props: {
             </scrollbox>
           </Show>
         </box>
-      </box>
 
-      <Show when={selected()}>
-        <box
-          width="100%"
-          flexDirection="row"
-          borderStyle="rounded"
-          borderColor={theme().border}
-          backgroundColor={theme().backgroundPanel}
-          paddingX={1}
-          paddingTop={1}
-          paddingBottom={1}
-          gap={2}
-          onMouseUp={(event) => {
-            event?.stopPropagation?.();
-          }}
-        >
-          <box flexDirection="column" flexGrow={1} minWidth={0} gap={1}>
+        <Show when={selected()}>
+          <box
+            width={detailWidth()}
+            flexShrink={0}
+            height={listHeight()}
+            flexDirection="column"
+            borderStyle="rounded"
+            borderColor={theme().border}
+            backgroundColor={theme().backgroundPanel}
+            paddingX={1}
+            paddingTop={1}
+            paddingBottom={1}
+            gap={1}
+            onMouseUp={(event) => {
+              event?.stopPropagation?.();
+            }}
+          >
             <box flexDirection="row" width="100%" justifyContent="space-between">
               <box flexDirection="row" flexShrink={1} minWidth={0}>
                 <text selectable={false} flexShrink={0} fg={theme().textMuted}>
@@ -801,32 +800,30 @@ function GraphWindow(props: {
                 </text>
               </scrollbox>
             </Show>
-          </box>
 
-          <Show when={showWorktrees()}>
-            <box
-              flexDirection="column"
-              flexShrink={0}
-              width={30}
-              gap={1}
-              borderStyle="rounded"
-              borderColor={theme().border}
-              backgroundColor={theme().backgroundElement}
-              paddingX={1}
-              paddingTop={1}
-              paddingBottom={1}
-            >
-              <text selectable={false} wrapMode="none" fg={theme().textMuted}>
-                <b>worktrees</b>
-              </text>
-              <For each={worktrees()}>
-                {(worktree) => (
-                  <box flexDirection="column" gap={0}>
+            <Show when={showWorktrees()}>
+              <box
+                flexDirection="column"
+                width="100%"
+                flexShrink={0}
+                gap={0}
+                borderStyle="rounded"
+                borderColor={theme().border}
+                backgroundColor={theme().backgroundElement}
+                paddingX={1}
+                paddingTop={1}
+                paddingBottom={1}
+              >
+                <text selectable={false} wrapMode="none" fg={theme().textMuted}>
+                  <b>worktrees</b>
+                </text>
+                <For each={worktrees()}>
+                  {(worktree) => (
                     <text
                       selectable={false}
                       wrapMode="none"
                       truncate
-                      fg={worktree.current ? theme().primary : theme().text}
+                      fg={worktree.current ? theme().primary : theme().textMuted}
                     >
                       {worktree.current ? "◉ " : "◌ "}
                       {worktree.branch ||
@@ -834,21 +831,13 @@ function GraphWindow(props: {
                           ? "detached"
                           : worktree.head.slice(0, 7))}
                     </text>
-                    <text
-                      selectable={false}
-                      wrapMode="none"
-                      truncate
-                      fg={theme().textMuted}
-                    >
-                      {worktree.path}
-                    </text>
-                  </box>
-                )}
-              </For>
-            </box>
-          </Show>
-        </box>
-      </Show>
+                  )}
+                </For>
+              </box>
+            </Show>
+          </box>
+        </Show>
+      </box>
 
       <box
         flexDirection="column"
