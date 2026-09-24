@@ -7,7 +7,7 @@ import type {
 import { RGBA, type MouseEvent, type ScrollBoxRenderable } from "@opentui/core";
 import { useTerminalDimensions } from "@opentui/solid";
 import { JSX } from "@opentui/solid/jsx-runtime";
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -40,6 +40,22 @@ const BRANCH_COLORS = [
   "#53c8f5",
   "#f79ad0",
 ].map((hex) => RGBA.fromHex(hex));
+
+const WORKTREE_COLORS = [
+  "#ffb347",
+  "#5eead4",
+  "#c4b5fd",
+  "#fda4af",
+  "#86efac",
+  "#93c5fd",
+  "#fde047",
+  "#f0abfc",
+].map((hex) => RGBA.fromHex(hex));
+
+function worktreeColor(index: number, theme: TuiThemeCurrent): RGBA {
+  if (index < 0) return theme.textMuted;
+  return WORKTREE_COLORS[index % WORKTREE_COLORS.length]!;
+}
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -237,6 +253,42 @@ function branchColor(
   return BRANCH_COLORS[section.order % BRANCH_COLORS.length];
 }
 
+let laneOrderSeq = 0;
+const laneOrderStore = new Map<string, number>();
+
+function stableLaneOrder(namespace: string, laneKey: string): number {
+  const key = `${namespace}\0${laneKey}`;
+  const existing = laneOrderStore.get(key);
+  if (existing !== undefined) return existing;
+  const seq = laneOrderSeq++;
+  laneOrderStore.set(key, seq);
+  return seq;
+}
+
+function parseCommitLog(out: string | undefined): CommitInfo[] {
+  const commits: CommitInfo[] = [];
+  if (!out) return commits;
+  for (const line of out.split("\n")) {
+    const [sha, short, ts, date, author, subject, parents] =
+      line.split(FIELD_SEP);
+    if (!sha) continue;
+    const parsedTs = Number.parseInt(ts ?? "", 10);
+    commits.push({
+      sha,
+      short: short ?? "",
+      date: date ?? "",
+      ts: Number.isFinite(parsedTs) ? parsedTs : 0,
+      author: stripAnsi(author ?? ""),
+      subject: stripAnsi(subject ?? ""),
+      parents: (parents ?? "")
+        .split(/\s+/u)
+        .map((parent) => parent.trim())
+        .filter(Boolean),
+    });
+  }
+  return commits;
+}
+
 function parseWorktrees(porcelain: string | undefined): WorktreeInfo[] {
   if (!porcelain) return [];
   const worktrees: WorktreeInfo[] = [];
@@ -295,6 +347,10 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
       worktree.current = false;
     }
   }
+  const commonDirRaw = (
+    (await runGit(["rev-parse", "--git-common-dir"], cwd)) ?? ""
+  ).trim();
+  const commonDir = commonDirRaw ? path.resolve(cwd, commonDirRaw) : cwdResolved;
 
   const branches: BranchCommitSection[] = [];
   let error = "";
@@ -309,53 +365,58 @@ async function collectRepo(cwd: string): Promise<GitGraphState> {
         .filter(Boolean)
     : [];
 
-  if (isWorktree && names.length === 0) {
-    error = "no branches";
-  }
-  if (names.length > 0) {
-    const ordered = headBranch
-      ? [headBranch, ...names.filter((name) => name !== headBranch)]
-      : names;
-    for (const [index, name] of ordered.slice(0, parseMaxBranches()).entries()) {
-      const out = await runGit(
-        [
-          "log",
-          "-n",
-          String(parseCommitsPerBranch()),
-          `--pretty=format:%H%x1f%h%x1f%ct%x1f%ad%x1f%an%x1f%s%x1f%P`,
-          "--date=short",
-          name,
-        ],
-        cwd,
-      );
-      const commits: CommitInfo[] = [];
-      if (out) {
-        for (const line of out.split("\n")) {
-          const [sha, short, ts, date, author, subject, parents] =
-            line.split(FIELD_SEP);
-          if (!sha) continue;
-          const parsedTs = Number.parseInt(ts ?? "", 10);
-          commits.push({
-            sha,
-            short: short ?? "",
-            date: date ?? "",
-            ts: Number.isFinite(parsedTs) ? parsedTs : 0,
-            author: stripAnsi(author ?? ""),
-            subject: stripAnsi(subject ?? ""),
-            parents: (parents ?? "")
-              .split(/\s+/u)
-              .map((parent) => parent.trim())
-              .filter(Boolean),
-          });
-        }
-      }
-      branches.push({
+  const logFormat = `--pretty=format:%H%x1f%h%x1f%ct%x1f%ad%x1f%an%x1f%s%x1f%P`;
+  const prioritized = headBranch
+    ? [headBranch, ...names.filter((name) => name !== headBranch)]
+    : names;
+  const fetchNames = prioritized.slice(0, parseMaxBranches());
+  for (const name of fetchNames) {
+    const out = await runGit(
+      [
+        "log",
+        "-n",
+        String(parseCommitsPerBranch()),
+        logFormat,
+        "--date=short",
         name,
-        order: index,
-        current: name === headBranch,
+      ],
+      cwd,
+    );
+    branches.push({
+      name,
+      order: stableLaneOrder(commonDir, name),
+      current: name === headBranch,
+      commits: parseCommitLog(out),
+    });
+  }
+
+  if (!headBranch && headSha && isWorktree) {
+    const out = await runGit(
+      [
+        "log",
+        "-n",
+        String(parseCommitsPerBranch()),
+        logFormat,
+        "--date=short",
+        headSha,
+      ],
+      cwd,
+    );
+    const commits = parseCommitLog(out);
+    if (commits.length > 0) {
+      branches.push({
+        name: `detached@${headSha.slice(0, 7)}`,
+        order: stableLaneOrder(commonDir, `detached:${cwdResolved}`),
+        current: true,
         commits,
       });
     }
+  }
+
+  branches.sort((a, b) => a.order - b.order);
+
+  if (isWorktree && branches.length === 0) {
+    error = "no branches";
   }
 
   return {
@@ -375,6 +436,8 @@ export interface LogLane {
   order: number;
   current: boolean;
   color: RGBA;
+  names?: string[];
+  worktree?: { current: boolean; count: number; color: RGBA; index: number };
 }
 
 export interface LogCell {
@@ -388,6 +451,7 @@ export interface LogRow {
   cells: LogCell[];
   isMerge: boolean;
   isHead: boolean;
+  refBadges: LogCell[];
 }
 
 export interface LogLayout {
@@ -396,16 +460,34 @@ export interface LogLayout {
 }
 
 function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
-  const bySha = new Map<string, { commit: CommitInfo; lanes: number[] }>();
+  const groups: BranchCommitSection[][] = [];
+  const sigToGroup = new Map<string, number>();
   for (const branch of state.branches) {
-    for (const commit of branch.commits) {
+    const sig = branch.commits.map((commit) => commit.sha).join("\n");
+    const existing = sigToGroup.get(sig);
+    if (existing === undefined) {
+      sigToGroup.set(sig, groups.length);
+      groups.push([branch]);
+    } else {
+      groups[existing]!.push(branch);
+    }
+  }
+  groups.sort(
+    (a, b) =>
+      Math.min(...a.map((branch) => branch.order)) -
+      Math.min(...b.map((branch) => branch.order)),
+  );
+
+  const bySha = new Map<string, { commit: CommitInfo; lanes: number[] }>();
+  for (let laneIndex = 0; laneIndex < groups.length; laneIndex++) {
+    for (const commit of groups[laneIndex]!.flatMap((branch) => branch.commits)) {
       let entry = bySha.get(commit.sha);
       if (!entry) {
         entry = { commit, lanes: [] };
         bySha.set(commit.sha, entry);
       }
-      if (!entry.lanes.includes(branch.order)) {
-        entry.lanes.push(branch.order);
+      if (!entry.lanes.includes(laneIndex)) {
+        entry.lanes.push(laneIndex);
       }
     }
   }
@@ -415,12 +497,47 @@ function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
       b.commit.ts - a.commit.ts || a.commit.sha.localeCompare(b.commit.sha),
   );
 
-  const lanes: LogLane[] = state.branches.map((branch) => ({
-    name: branch.name,
-    order: branch.order,
-    current: branch.current,
-    color: branchColor(branch, theme),
-  }));
+  const lanes: LogLane[] = groups.map((group, laneIndex) => {
+    const primary =
+      group.find((branch) => branch.current) ?? group[0]!;
+    const names = group.map((branch) => branch.name);
+    const groupShas = new Set(
+      group.flatMap((branch) => branch.commits.map((commit) => commit.sha)),
+    );
+    const matchingWorktrees = state.worktrees.filter((worktree) => {
+      if (worktree.branch) return names.includes(worktree.branch);
+      if (worktree.head) return groupShas.has(worktree.head);
+      return false;
+    });
+    const worktreeIndex =
+      matchingWorktrees.length > 0
+        ? state.worktrees.findIndex(
+            (worktree) =>
+              matchingWorktrees.some((match) => match.path === worktree.path),
+          )
+        : -1;
+    return {
+      name: primary.name,
+      order: laneIndex,
+      current: group.some((branch) => branch.current),
+      color: branchColor(primary, theme),
+      names,
+      worktree:
+        matchingWorktrees.length > 0
+          ? {
+              current: matchingWorktrees.some((worktree) => worktree.current),
+              count: matchingWorktrees.length,
+              color: matchingWorktrees.some((worktree) => worktree.current)
+                ? theme.primary
+                : worktreeColor(
+                    state.worktrees.indexOf(matchingWorktrees[0]!),
+                    theme,
+                  ),
+              index: worktreeIndex,
+            }
+          : undefined,
+    };
+  });
 
   const laneStart = new Map<number, number>();
   sorted.forEach((entry, index) => {
@@ -464,7 +581,7 @@ function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
       if (entry.lanes.includes(col)) {
         cells.push({
           char: isHead ? "\u25c9" : "\u25cf",
-          color: lanes[col].color,
+          color: lanes[col]!.color,
         });
       } else if (start !== undefined && index >= start) {
         cells.push({ char: "\u2502", color: lanes[col].color });
@@ -475,11 +592,36 @@ function buildLog(state: GitGraphState, theme: TuiThemeCurrent): LogLayout {
     if (bridgeCols.length > 1 || (isMerge && maxCol > minCol)) {
       for (let col = minCol + 1; col < maxCol; col++) {
         if (cells[col]?.char === " " || cells[col]?.char === "\u2502") {
-          cells[col] = { char: "\u2500", color: lanes[primary].color };
+          cells[col] = { char: "\u2500", color: lanes[primary]!.color };
         }
       }
     }
-    return { commit: entry.commit, primary, cells, isMerge, isHead };
+    const refBadges: LogCell[] = [];
+    for (const col of entry.lanes) {
+      if (laneStart.get(col) !== index) continue;
+      const lane = lanes[col];
+      if (!lane) continue;
+      if ((lane.names?.length ?? 1) > 1) {
+        refBadges.push({
+          char: ` ×${lane.names?.length ?? 1}`,
+          color: theme.textMuted,
+        });
+      }
+      if (lane.worktree) {
+        refBadges.push({
+          char: " ⌂",
+          color: lane.worktree.color,
+        });
+      }
+    }
+    return {
+      commit: entry.commit,
+      primary,
+      cells,
+      isMerge,
+      isHead,
+      refBadges,
+    };
   });
 
   return { lanes, rows };
@@ -498,49 +640,72 @@ function GraphWindow(props: {
   const [loading, setLoading] = createSignal(false);
   const [mergeBase, setMergeBase] = createSignal("");
   let listScroll: ScrollBoxRenderable | undefined;
+  let messageScroll: ScrollBoxRenderable | undefined;
 
   const state = () => props.repo();
   const theme = () => props.theme;
-  const width = () => Math.min(116, Math.max(40, dimensions().width - 2));
+  const width = () => Math.min(145, Math.max(40, dimensions().width - 2));
   const layout = () => buildLog(state(), theme());
-
-  // Dialog backdrop pads top by termH/4; cap content at ~0.6*termH (+20% on
-  // the old termH/2 cap) so the panel stays centered and never cut off.
-  const contentMax = () =>
-    Math.max(14, Math.floor(dimensions().height * 0.6) - 2);
-
-  const chromeRows = () => {
-    const header = 2;
-    const gaps = 3;
-    const legend = 5;
-    return header + gaps + legend;
+  const [legendMode, setLegendMode] = createSignal<"branches" | "worktrees">(
+    "branches",
+  );
+  const worktrees = () => state().worktrees;
+  const toggleLegendMode = () => {
+    setLegendMode((mode) =>
+      mode === "branches" ? "worktrees" : "branches",
+    );
   };
 
-  const listHeight = () => {
-    const budget = Math.max(6, contentMax() - chromeRows());
-    const rows = layout().rows.length;
-    return Math.max(6, Math.min(rows || 6, budget));
-  };
+  onMount(() => {
+    const disposeLayer = props.api.keymap.registerLayer({
+      commands: [
+        {
+          name: "git-graph.toggle-legend",
+          title: "Toggle branches/worktrees legend",
+          category: "VCS",
+          run() {
+            toggleLegendMode();
+          },
+        },
+        {
+          name: "git-graph.message-scroll-up",
+          title: "Scroll commit message up",
+          category: "VCS",
+          run() {
+            scrollMessage(-3);
+          },
+        },
+        {
+          name: "git-graph.message-scroll-down",
+          title: "Scroll commit message down",
+          category: "VCS",
+          run() {
+            scrollMessage(3);
+          },
+        },
+      ],
+      bindings: [
+        { key: "w", cmd: "git-graph.toggle-legend" },
+        { key: "shift+up", cmd: "git-graph.message-scroll-up" },
+        { key: "shift+down", cmd: "git-graph.message-scroll-down" },
+      ],
+    });
+    onCleanup(() => {
+      disposeLayer?.();
+    });
+  });
 
-  const detailWidth = () =>
-    Math.max(36, Math.min(56, Math.floor(width() * 0.45)));
-
-  const bodyHeight = () => {
-    const row = selected();
-    if (!row) return 0;
-    const parentLines =
-      row.commit.parents.length > 1 ? row.commit.parents.length : 1;
-    const baseLines = mergeBase() ? 1 : 0;
-    const worktreeLines = showWorktrees()
-      ? 4 + worktrees().length
-      : 0;
-    // meta + subject + parents + merge-base + loading + gaps + worktrees
-    const innerChrome = 6 + parentLines + baseLines + worktreeLines;
-    return Math.max(2, listHeight() - innerChrome);
+  const detailWidth = () => {
+    const budget = Math.floor(width() * 0.52);
+    return Math.max(48, Math.min(90, budget));
   };
 
   const scrollList = (delta: number) => {
     listScroll?.scrollBy(delta, "viewport");
+  };
+
+  const scrollMessage = (delta: number) => {
+    messageScroll?.scrollBy(delta, "viewport");
   };
 
   const select = (row: LogRow) => {
@@ -548,6 +713,7 @@ function GraphWindow(props: {
     setMessage("");
     setMergeBase("");
     setLoading(true);
+    messageScroll?.scrollTo(0);
     const cwd =
       props.api.state.path.worktree || props.api.state.path.directory;
     void runGit(["log", "-1", "--format=%B", row.commit.sha], cwd).then(
@@ -562,6 +728,7 @@ function GraphWindow(props: {
             ? rest.trim()
             : full.trim();
         setMessage(body.slice(0, MESSAGE_MAX_CHARS));
+        messageScroll?.scrollTo(0);
       },
     );
     if (row.commit.parents.length >= 2) {
@@ -593,20 +760,19 @@ function GraphWindow(props: {
     return layout().lanes.find((lane) => lane.order === row.primary);
   };
 
-  const worktrees = () => state().worktrees;
-  const showWorktrees = () => worktrees().length > 1;
-
   return (
     <box
       flexDirection="column"
       width="100%"
+      height="100%"
       gap={1}
-      maxHeight={contentMax()}
+      overflow="hidden"
     >
       <box
         flexDirection="row"
         width="100%"
         justifyContent="space-between"
+        flexShrink={0}
         paddingBottom={1}
       >
         <box flexDirection="row" flexShrink={1}>
@@ -633,7 +799,7 @@ function GraphWindow(props: {
           </Show>
         </box>
         <text selectable={false} flexShrink={0} wrapMode="none" fg={theme().textMuted}>
-          click a commit · esc closes
+          click a commit · w legend · ⇧↑/⇧↓ message · esc closes
         </text>
       </box>
 
@@ -641,13 +807,13 @@ function GraphWindow(props: {
         flexDirection="row"
         width="100%"
         gap={2}
-        height={listHeight()}
-        minHeight={listHeight()}
+        flexGrow={1}
+        flexShrink={1}
+        minHeight={6}
       >
         <box
           flexDirection="column"
           flexShrink={0}
-          height={listHeight()}
           justifyContent="space-between"
           paddingRight={1}
         >
@@ -673,7 +839,7 @@ function GraphWindow(props: {
           </box>
         </box>
 
-        <box flexGrow={1} minWidth={0}>
+        <box flexGrow={1} flexShrink={1} minWidth={0} minHeight={0}>
           <Show
             when={layout().rows.length > 0}
             fallback={
@@ -686,7 +852,7 @@ function GraphWindow(props: {
           >
             <scrollbox
               width="100%"
-              height={listHeight()}
+              height="100%"
               ref={(el: ScrollBoxRenderable) => {
                 listScroll = el;
               }}
@@ -709,6 +875,13 @@ function GraphWindow(props: {
                           {(cell) => (
                             <text selectable={false} fg={cell.color ?? theme().textMuted}>
                               {cell.char}
+                            </text>
+                          )}
+                        </For>
+                        <For each={row.refBadges}>
+                          {(badge) => (
+                            <text selectable={false} fg={badge.color ?? theme().textMuted}>
+                              {badge.char}
                             </text>
                           )}
                         </For>
@@ -750,7 +923,6 @@ function GraphWindow(props: {
           <box
             width={detailWidth()}
             flexShrink={0}
-            height={listHeight()}
             flexDirection="column"
             borderStyle="rounded"
             borderColor={theme().border}
@@ -759,24 +931,76 @@ function GraphWindow(props: {
             paddingTop={1}
             paddingBottom={1}
             gap={1}
+            overflow="hidden"
             onMouseUp={(event) => {
               event?.stopPropagation?.();
             }}
+            onMouseScroll={(event) => {
+              const delta = event.scroll?.delta ?? 1;
+              if (event.scroll?.direction === "up") {
+                scrollMessage(-delta);
+              } else if (event.scroll?.direction === "down") {
+                scrollMessage(delta);
+              }
+              event.stopPropagation();
+            }}
           >
-            <box flexDirection="row" width="100%" justifyContent="space-between">
-              <box flexDirection="row" flexShrink={1} minWidth={0}>
-                <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+            <box
+              flexDirection="column"
+              width="100%"
+              gap={1}
+              flexShrink={0}
+            >
+              <box
+                flexDirection="row"
+                width="100%"
+                justifyContent="space-between"
+              >
+                <text selectable={false} flexShrink={0} fg={theme().primary}>
                   {selected()!.commit.short}
                 </text>
-                <text selectable={false} flexShrink={1} truncate wrapMode="none" fg={theme().textMuted}>
-                  {"  "}
+                <box flexDirection="row" flexShrink={0} gap={1}>
+                  <box onMouseUp={(event) => openSelectedDiff(event)}>
+                    <text selectable={false} fg={theme().primary}>
+                      ↗
+                    </text>
+                  </box>
+                  <box
+                    onMouseUp={(event) => {
+                      event?.stopPropagation?.();
+                      clearSelection();
+                    }}
+                  >
+                    <text selectable={false} fg={theme().warning}>
+                      ⊗
+                    </text>
+                  </box>
+                </box>
+              </box>
+              <box flexDirection="row" width="100%" gap={2} flexShrink={0}>
+                <text
+                  selectable={false}
+                  flexShrink={1}
+                  truncate
+                  wrapMode="none"
+                  fg={theme().textMuted}
+                >
                   {selected()!.commit.author}
-                </text>
-                <text selectable={false} flexShrink={0} fg={theme().textMuted}>
-                  {"  "}
+                  {"  ·  "}
                   {selected()!.commit.date}
                 </text>
-                <Show when={selectedLane()}>
+                <Show when={selected()!.isMerge}>
+                  <text
+                    selectable={false}
+                    flexShrink={0}
+                    fg={theme().primary}
+                  >
+                    ⑂ merge
+                  </text>
+                </Show>
+              </box>
+              <box flexDirection="row" width="100%" gap={2} flexShrink={0}>
+                <Show when={selectedLane()} keyed>
                   {(lane: LogLane) => (
                     <text
                       selectable={false}
@@ -785,128 +1009,168 @@ function GraphWindow(props: {
                       wrapMode="none"
                       fg={lane.color}
                     >
-                      {"  "}
                       ◉ {lane.name}
+                      {(lane.names?.length ?? 1) > 1
+                        ? ` +${(lane.names?.length ?? 1) - 1}`
+                        : ""}
+                      {lane.worktree ? (
+                        <span style={{ fg: lane.worktree.color }}> ⌂</span>
+                      ) : (
+                        ""
+                      )}
                     </text>
                   )}
                 </Show>
-                <Show when={selected()!.isMerge}>
-                  <text selectable={false} flexShrink={0} fg={theme().primary}>
-                    {"  "}
-                    ⑂ merge
-                  </text>
-                </Show>
               </box>
-              <box flexDirection="row" flexShrink={0} gap={1}>
-                <box onMouseUp={(event) => openSelectedDiff(event)}>
-                  <text selectable={false} fg={theme().primary}>
-                    ↗
+              <text
+                selectable={false}
+                flexShrink={0}
+                truncate
+                wrapMode="none"
+                fg={theme().text}
+              >
+                <b>{selected()!.commit.subject}</b>
+              </text>
+              <Show
+                when={
+                  selectedLane() && (selectedLane()!.names?.length ?? 1) > 1
+                    ? selectedLane()!
+                    : undefined
+                }
+                keyed
+              >
+                {(lane: LogLane) => (
+                  <text
+                    selectable={false}
+                    flexShrink={0}
+                    wrapMode="none"
+                    truncate
+                    fg={theme().textMuted}
+                  >
+                    refs: {(lane.names ?? [lane.name]).join(", ")}
                   </text>
-                </box>
+                )}
+              </Show>
+              <Show when={selected()!.commit.parents.length > 0}>
                 <box
-                  onMouseUp={(event) => {
-                    event?.stopPropagation?.();
-                    clearSelection();
+                  flexDirection="column"
+                  width="100%"
+                  gap={0}
+                  flexShrink={0}
+                >
+                  <For each={selected()!.commit.parents}>
+                    {(parent, index) => {
+                      const branchNames = state().branches
+                        .filter((branch) =>
+                          branch.commits.some((c) => c.sha === parent),
+                        )
+                        .map((branch) => branch.name);
+                      const label =
+                        selected()!.commit.parents.length > 1
+                          ? index() === 0
+                            ? "first: "
+                            : `merged${index() > 1 ? ` ${index()}` : ""}: `
+                          : "parent: ";
+                      return (
+                        <text
+                          selectable={false}
+                          flexShrink={0}
+                          wrapMode="none"
+                          truncate
+                          fg={theme().textMuted}
+                        >
+                          {label}
+                          {parent.slice(0, 7)}
+                          {branchNames.length > 0
+                            ? ` (${branchNames.join(", ")})`
+                            : ""}
+                        </text>
+                      );
+                    }}
+                  </For>
+                </box>
+              </Show>
+              <Show when={mergeBase()}>
+                <text
+                  selectable={false}
+                  flexShrink={0}
+                  wrapMode="none"
+                  truncate
+                  fg={theme().textMuted}
+                >
+                  merge-base: {mergeBase()}
+                </text>
+              </Show>
+            </box>
+            <box
+              flexDirection="column"
+              width="100%"
+              flexGrow={1}
+              flexShrink={1}
+              minHeight={0}
+              gap={0}
+            >
+              <Show when={loading()}>
+                <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+                  loading message…
+                </text>
+              </Show>
+              <Show when={!loading() && !message()}>
+                <text selectable={false} flexShrink={0} fg={theme().textMuted}>
+                  (no message body)
+                </text>
+              </Show>
+              <Show when={!loading() && message()}>
+                <box
+                  flexDirection="row"
+                  width="100%"
+                  justifyContent="space-between"
+                  flexShrink={0}
+                >
+                  <text selectable={false} fg={theme().textMuted}>
+                    message
+                  </text>
+                  <box flexDirection="row" flexShrink={0} gap={1}>
+                    <box
+                      onMouseUp={(event) => {
+                        event?.stopPropagation?.();
+                        scrollMessage(-3);
+                      }}
+                    >
+                      <text selectable={false} fg={theme().primary}>
+                        ▲
+                      </text>
+                    </box>
+                    <box
+                      onMouseUp={(event) => {
+                        event?.stopPropagation?.();
+                        scrollMessage(3);
+                      }}
+                    >
+                      <text selectable={false} fg={theme().primary}>
+                        ▼
+                      </text>
+                    </box>
+                  </box>
+                </box>
+                <scrollbox
+                  width="100%"
+                  flexGrow={1}
+                  flexShrink={1}
+                  minHeight={3}
+                  ref={(el: ScrollBoxRenderable) => {
+                    messageScroll = el;
+                  }}
+                  onMouseScroll={(event) => {
+                    event.stopPropagation();
                   }}
                 >
-                  <text selectable={false} fg={theme().warning}>
-                    ⊗
+                  <text selectable={false} wrapMode="word" fg={theme().text}>
+                    {message()}
                   </text>
-                </box>
-              </box>
+                </scrollbox>
+              </Show>
             </box>
-            <text selectable={false} wrapMode="word" fg={theme().text}>
-              <b>{selected()!.commit.subject}</b>
-            </text>
-            <Show when={selected()!.commit.parents.length > 0}>
-              <box flexDirection="column" width="100%" gap={0}>
-                <For each={selected()!.commit.parents}>
-                  {(parent, index) => {
-                    const branchNames = state().branches
-                      .filter((branch) =>
-                        branch.commits.some((c) => c.sha === parent),
-                      )
-                      .map((branch) => branch.name);
-                    const label =
-                      selected()!.commit.parents.length > 1
-                        ? index() === 0
-                          ? "first: "
-                          : `merged${index() > 1 ? ` ${index()}` : ""}: `
-                        : "parent: ";
-                    return (
-                      <text selectable={false} wrapMode="none" truncate fg={theme().textMuted}>
-                        {label}
-                        {parent.slice(0, 7)}
-                        {branchNames.length > 0
-                          ? ` (${branchNames.join(", ")})`
-                          : ""}
-                      </text>
-                    );
-                  }}
-                </For>
-              </box>
-            </Show>
-            <Show when={mergeBase()}>
-              <text selectable={false} wrapMode="none" truncate fg={theme().textMuted}>
-                merge-base: {mergeBase()}
-              </text>
-            </Show>
-            <Show when={loading()}>
-              <text selectable={false} fg={theme().textMuted}>
-                loading message…
-              </text>
-            </Show>
-            <Show
-              when={message()}
-              fallback={
-                <Show when={!loading()}>
-                  <text selectable={false} fg={theme().textMuted}>
-                    (no message body)
-                  </text>
-                </Show>
-              }
-            >
-              <scrollbox width="100%" height={bodyHeight()}>
-                <text selectable={false} wrapMode="word" fg={theme().text}>
-                  {message()}
-                </text>
-              </scrollbox>
-            </Show>
-
-            <Show when={showWorktrees()}>
-              <box
-                flexDirection="column"
-                width="100%"
-                flexShrink={0}
-                gap={0}
-                borderStyle="rounded"
-                borderColor={theme().border}
-                backgroundColor={theme().backgroundElement}
-                paddingX={1}
-                paddingTop={1}
-                paddingBottom={1}
-              >
-                <text selectable={false} wrapMode="none" fg={theme().textMuted}>
-                  <b>worktrees</b>
-                </text>
-                <For each={worktrees()}>
-                  {(worktree) => (
-                    <text
-                      selectable={false}
-                      wrapMode="none"
-                      truncate
-                      fg={worktree.current ? theme().primary : theme().textMuted}
-                    >
-                      {worktree.current ? "◉ " : "◌ "}
-                      {worktree.branch ||
-                        (worktree.detached
-                          ? "detached"
-                          : worktree.head.slice(0, 7))}
-                    </text>
-                  )}
-                </For>
-              </box>
-            </Show>
           </box>
         </Show>
       </box>
@@ -922,23 +1186,146 @@ function GraphWindow(props: {
         paddingTop={1}
         paddingBottom={1}
         marginTop={1}
+        flexShrink={0}
+        overflow="hidden"
       >
-        <text selectable={false} wrapMode="none" fg={theme().textMuted}>
-          branches
-        </text>
-        <box flexDirection="row" width="100%" flexWrap="wrap" gap={2}>
-          <For each={layout().lanes}>
-            {(lane) => (
-              <box flexDirection="row" flexShrink={0}>
-                <text selectable={false} wrapMode="none" fg={lane.color}>
-                  <b>
-                    {lane.current ? "◉" : "◌"} {lane.name}
-                  </b>
-                </text>
-              </box>
-            )}
-          </For>
+        <box
+          flexDirection="row"
+          width="100%"
+          justifyContent="space-between"
+          flexShrink={0}
+        >
+          <box flexDirection="row" gap={2} flexShrink={0}>
+            <box
+              onMouseUp={(event) => {
+                event?.stopPropagation?.();
+                setLegendMode("branches");
+              }}
+            >
+              <text
+                selectable={false}
+                wrapMode="none"
+                fg={
+                  legendMode() === "branches"
+                    ? theme().primary
+                    : theme().textMuted
+                }
+              >
+                {legendMode() === "branches" ? (
+                  <b>branches</b>
+                ) : (
+                  "branches"
+                )}
+              </text>
+            </box>
+            <box
+              onMouseUp={(event) => {
+                event?.stopPropagation?.();
+                setLegendMode("worktrees");
+              }}
+            >
+              <text
+                selectable={false}
+                wrapMode="none"
+                fg={
+                  legendMode() === "worktrees"
+                    ? theme().primary
+                    : theme().textMuted
+                }
+              >
+                {legendMode() === "worktrees" ? (
+                  <b>worktrees</b>
+                ) : (
+                  "worktrees"
+                )}
+              </text>
+            </box>
+          </box>
+          <text selectable={false} wrapMode="none" fg={theme().textMuted}>
+            w toggles
+          </text>
         </box>
+        <Show
+          when={legendMode() === "branches"}
+          fallback={
+            <box flexDirection="column" width="100%" gap={0} flexShrink={0}>
+              <Show
+                when={worktrees().length > 0}
+                fallback={
+                  <text selectable={false} fg={theme().textMuted}>
+                    no worktrees
+                  </text>
+                }
+              >
+                <For each={worktrees()}>
+                  {(worktree, index) => (
+                    <text
+                      selectable={false}
+                      wrapMode="none"
+                      truncate
+                      fg={
+                        worktree.current
+                          ? theme().primary
+                          : worktreeColor(index(), theme())
+                      }
+                    >
+                      {worktree.current ? "◉ " : "◌ "}
+                      {worktree.branch ||
+                        (worktree.detached
+                          ? "detached"
+                          : worktree.head.slice(0, 7))}
+                      {"  "}
+                      {abbreviateHome(
+                        worktree.path.replace(/ \(bare\)$/u, ""),
+                        os.homedir(),
+                      )}
+                      {worktree.path.endsWith(" (bare)") ? " (bare)" : ""}
+                    </text>
+                  )}
+                </For>
+              </Show>
+            </box>
+          }
+        >
+          <box
+            flexDirection="row"
+            width="100%"
+            flexWrap="wrap"
+            gap={2}
+            flexShrink={0}
+            overflow="hidden"
+          >
+            <For each={layout().lanes}>
+              {(lane) => (
+                <box flexDirection="row" flexShrink={0}>
+                  <text selectable={false} wrapMode="none" fg={lane.color}>
+                    <b>
+                      {lane.current ? "◉" : "◌"} {lane.name}
+                      {(lane.names?.length ?? 1) > 1
+                        ? ` +${(lane.names?.length ?? 1) - 1}`
+                        : ""}
+                    </b>
+                  </text>
+                  <Show when={lane.worktree} keyed>
+                    {(worktree: NonNullable<LogLane["worktree"]>) => (
+                      <text
+                        selectable={false}
+                        wrapMode="none"
+                        fg={worktree.color}
+                      >
+                        <b>
+                          {worktree.count > 1
+                            ? ` ⌂${worktree.count}`
+                            : " ⌂"}
+                        </b>
+                      </text>
+                    )}
+                  </Show>
+                </box>
+              )}
+            </For>
+          </box>
+        </Show>
       </box>
     </box>
   );

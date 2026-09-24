@@ -11,12 +11,15 @@ Opens a dialog with a vertical git-log lane graph, commit list, and a right-hand
 ## What you get
 
 - **Lane graph** with branch colours; current branch lane uses the theme primary colour
-- **HEAD marker** - the current commit shows `◉` in the graph and `→ short-sha` in the list; detached HEAD shows `HEAD → sha` in the header
+- **Stable lanes** - column order and colours persist across branch switches (first-seen order per repo, not "current branch first")
+- **HEAD marker** - the current commit shows `◉` in the graph and `→ short-sha` in the list; detached HEAD shows `HEAD → sha` in the header and a `detached@sha` lane
+- **Collapsed refs** - branches that share the same history draw one lane; the tip shows `×N` and the legend/detail show `name +N`
+- **Worktree badges** - lanes checked out in a worktree show `⌂` on the tip, colour-coded per worktree (primary for the current worktree); detached worktrees badge the lane that contains their HEAD sha
 - **Merge visibility** - `⑂` badge, horizontal bridge in the graph; detail pane lists `first:` / `merged:` parents and the **merge-base**
 - **Click a commit** → message, parents, merge-base, author/date on the right (graph stays left)
-- **Worktrees** panel when the repo has more than one worktree
+- **Legend toggle** - press **`w`** or click the **branches** / **worktrees** tabs in the bottom panel
 - **↗** open unified diff in your IDE / default diff viewer
-- Scroll arrows (▲/▼), branch legend at the bottom
+- Scroll arrows (▲/▼) for the commit list and message; **wheel** over the detail pane scrolls the message; **⇧↑/⇧↓** also scroll it
 - Auto-refresh on session/file/git events plus a periodic fallback
 - Sidebar footer shows path:branch, OpenCode version, and a **⑂ Git Graph** shortcut (alongside the built-in footer content)
 
